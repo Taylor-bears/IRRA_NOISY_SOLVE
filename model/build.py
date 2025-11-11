@@ -28,8 +28,8 @@ class IRRA(nn.Module):
             # 初始化分类器权重
             nn.init.normal_(self.classifier.weight.data, std=0.001)
             nn.init.constant_(self.classifier.bias.data, val=0.0)
-        # MLM任务，掩码语言建模
-        if 'mlm' in args.loss_names:
+        # 跨模态模块：供 MLM 或 噪声检测 复用
+        if ('mlm' in args.loss_names) or getattr(args, 'noise_detection', False):
             # 跨模态注意力层（文本→图像）
             self.cross_attn = nn.MultiheadAttention(self.embed_dim,
                                                     self.embed_dim // 64,
@@ -60,15 +60,31 @@ class IRRA(nn.Module):
             nn.init.normal_(self.cross_attn.in_proj_weight, std=attn_std)
             nn.init.normal_(self.cross_attn.out_proj.weight, std=proj_std)
 
-            # MLM预测头：4层结构（线性→GELU→归一化→线性）
-            self.mlm_head = nn.Sequential(
-                OrderedDict([('dense', nn.Linear(self.embed_dim, self.embed_dim)),
-                            ('gelu', QuickGELU()),
-                            ('ln', LayerNorm(self.embed_dim)),
-                            ('fc', nn.Linear(self.embed_dim, args.vocab_size))]))
-            # 初始化MLM头权重
-            nn.init.normal_(self.mlm_head.dense.weight, std=fc_std)
-            nn.init.normal_(self.mlm_head.fc.weight, std=proj_std)
+            # 当使用MLM任务时，构建MLM头
+            if 'mlm' in args.loss_names:
+                # MLM预测头：4层结构（线性→GELU→归一化→线性）
+                self.mlm_head = nn.Sequential(
+                    OrderedDict([('dense', nn.Linear(self.embed_dim, self.embed_dim)),
+                                ('gelu', QuickGELU()),
+                                ('ln', LayerNorm(self.embed_dim)),
+                                ('fc', nn.Linear(self.embed_dim, args.vocab_size))]))
+                # 初始化MLM头权重
+                nn.init.normal_(self.mlm_head.dense.weight, std=fc_std)
+                nn.init.normal_(self.mlm_head.fc.weight, std=proj_std)
+
+            # 当启用噪声检测时，构建二分类头
+            if getattr(args, 'noise_detection', False):
+                self.noise_detection_head = nn.Sequential(
+                    OrderedDict([
+                        ('dense', nn.Linear(self.embed_dim, self.embed_dim)),
+                        ('gelu', QuickGELU()),
+                        ('ln', LayerNorm(self.embed_dim)),
+                        ('fc', nn.Linear(self.embed_dim, 2))
+                    ])
+                )
+                # 初始化噪声检测头权重
+                nn.init.normal_(self.noise_detection_head.dense.weight, std=fc_std)
+                nn.init.normal_(self.noise_detection_head.fc.weight, std=proj_std)
 
     # 设置当前任务
     def _set_task(self):
@@ -131,15 +147,21 @@ class IRRA(nn.Module):
             ret.update({'cmpm_loss':objectives.compute_cmpm(i_feats, t_feats, batch['pids'])})
         
         if 'id' in self.current_task:
+            # 图像身份分类：使用分类器预测行人ID
             image_logits = self.classifier(i_feats.half()).float()
+            # 文本身份分类
             text_logits = self.classifier(t_feats.half()).float()
+            # # 计算身份识别损失，损失是用来学习的
             ret.update({'id_loss':objectives.compute_id(image_logits, text_logits, batch['pids'])*self.args.id_loss_weight})
-
+            # 计算预测结果（取概率最大的类别）
             image_pred = torch.argmax(image_logits, dim=1)
             text_pred = torch.argmax(text_logits, dim=1)
-
+            # 计算准确率指标，准确率是用来评估的
+            # 计算图像分类准确率
             image_precision = (image_pred == batch['pids']).float().mean()
+            # 计算文本分类准确率
             text_precision = (text_pred == batch['pids']).float().mean()
+            # 记录准确率指标
             ret.update({'img_acc': image_precision})
             ret.update({'txt_acc': text_precision})
         
@@ -147,19 +169,42 @@ class IRRA(nn.Module):
             mlm_ids = batch['mlm_ids']
 
             mlm_feats = self.base_model.encode_text(mlm_ids)
-
+            # 跨模态注意力：使用图像特征来帮助恢复被掩码的文本
             x = self.cross_former(mlm_feats, image_feats, image_feats)
-
+            # MLM头部：将特征映射到词汇表空间
             x = self.mlm_head(x)  # [batch_size, text_len, num_colors]
-
+            # 重塑为二维张量以便计算损失
             scores = x.float().reshape(-1, self.args.vocab_size)
             mlm_labels = batch['mlm_labels'].reshape(-1)
             ret.update({'mlm_loss': objectives.compute_mlm(scores, mlm_labels)*self.args.mlm_loss_weight})
-
+            # 计算MLM准确率指标
             pred = scores.max(1)[1]
             mlm_label_idx = torch.nonzero(mlm_labels)
             acc = (pred[mlm_label_idx] == mlm_labels[mlm_label_idx]).float().mean()
             ret.update({'mlm_acc': acc})
+
+        # 噪声检测分支（token-level 二分类）：输入为噪声文本与对应图像
+        if getattr(self.args, 'noise_detection', False) and ('noise_labels' in batch): # new
+            # 使用原始caption_ids（噪声文本）对应的文本序列特征作为query
+            # text_feats 来自 self.base_model(images, caption_ids) 已计算，为整序列 (B, L, D)
+            # 跨模态融合：文本特征作为query，图像特征作为key和value
+            fused = self.cross_former(text_feats, image_feats, image_feats)  # (B, L, D)
+            # 噪声检测头部：每个token位置进行二分类（噪声/干净）
+            noise_logits = self.noise_detection_head(fused)  # (B, L, 2)
+            noise_labels = batch['noise_labels']  # (B, L)
+            attribute_mask = batch.get('attribute_mask', torch.ones_like(noise_labels, dtype=torch.float))
+            noise_loss = objectives.compute_noise_detection(noise_logits.float(), noise_labels, attribute_mask) * getattr(self.args, 'noise_loss_weight', 1.0) # 这里的权重有待调整
+            ret.update({'noise_loss': noise_loss})
+
+            # 仅在mask位置统计准确率
+            with torch.no_grad():
+                pred = noise_logits.argmax(dim=-1)
+                mask = attribute_mask > 0
+                if mask.sum() > 0:
+                    acc = (pred[mask] == noise_labels[mask]).float().mean()
+                else:
+                    acc = torch.tensor(0.0, device=pred.device)
+            ret.update({'noise_acc': acc})
 
         return ret # 返回所有损失和指标
 

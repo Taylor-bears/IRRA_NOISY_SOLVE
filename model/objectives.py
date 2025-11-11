@@ -131,3 +131,29 @@ def compute_cmpm(image_embeddings, text_embeddings, labels, epsilon=1e-8):
     cmpm_loss = torch.mean(torch.sum(i2t_loss, dim=1)) + torch.mean(torch.sum(t2i_loss, dim=1))
 
     return cmpm_loss
+
+
+# 噪声检测损失：按token的二分类交叉熵，并通过attribute_mask选择参与监督的token位置
+def compute_noise_detection(noise_logits, noise_labels, attribute_mask):
+    """
+    Args:
+        noise_logits: Tensor (B, L, 2) 每个token的二分类logits
+        noise_labels: Tensor (B, L)    每个token的标签，0=干净, 1=噪声
+        attribute_mask: Tensor (B, L)  掩码，1表示该位置参与loss计算
+    Returns:
+        loss: 标量
+    """
+    B, L, C = noise_logits.shape
+    logits = noise_logits.reshape(-1, C) # (B*L, 2)
+    labels = noise_labels.reshape(-1) # (B*L)
+    mask = attribute_mask.reshape(-1).float() # (B*L)
+
+    # 逐位置交叉熵(包含计算softmax，并取正确类别的概率并计算-log)
+    # 交叉熵计算出来的概率，有以下的意义：
+    # 预测正确时：概率接近1 → -log(1)=0 → 损失很小
+    # 预测错误时：概率接近0 → -log(0)=∞ → 损失很大
+    # 不确定时：概率接近0.5 → -log(0.5)=0.69 → 中等损失
+    per_token_loss = F.cross_entropy(logits, labels, reduction='none')
+    # 按照学长的说法，仅在mask位置累积，目前有mask的位置就是注入噪声的位置
+    loss = (per_token_loss * mask).sum() / (mask.sum() + 1e-8)
+    return loss

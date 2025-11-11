@@ -29,6 +29,12 @@ def get_args():
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
+    # 噪声检测任务相关设置
+    parser.add_argument("--noise_detection", default=False, action='store_true', help='enable noise token detection task; replaces mlm prediction with token-level noise classification')
+    parser.add_argument("--noise_loss_weight", type=float, default=1.0, help='loss weight for noise detection (token-level)')
+    parser.add_argument("--noisy_train_json", type=str, default='', help='path to noisy train json containing captions_rw field')
+    # 测试时掩码噪声token
+    parser.add_argument("--mask_noise_at_test", default=False, action='store_true', help='predict and mask noise tokens at test-time when noise_detection head exists')
     
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))

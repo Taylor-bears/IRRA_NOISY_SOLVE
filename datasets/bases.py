@@ -9,6 +9,8 @@ from prettytable import PrettyTable
 import random
 import regex as re
 import copy
+from utils.iotools import read_json
+import difflib
 
 class BaseDataset(object):
     """
@@ -192,6 +194,7 @@ class ImageTextMLMDataset(Dataset):
         }
 
         return ret
+    
     # 构建随机掩码token序列和标签的方法
     def _build_random_masked_tokens_and_labels(self, tokens):
         """
@@ -236,3 +239,128 @@ class ImageTextMLMDataset(Dataset):
             tokens[1] = mask
 
         return torch.tensor(tokens), torch.tensor(labels)
+
+
+# new
+class ImageTextNoiseDetectionDataset(Dataset):
+    """
+    用于噪声词检测任务的图文数据集。
+    直接读取包含 clean captions 与 noisy captions (captions_rw) 的训练 JSON。
+
+    说明：为了避免依赖外部属性词词表，初版实现采用 clean/noisy token 的逐位差异作为监督信号，
+    仅在差异位置参与监督，满足“尽可能只在属性相关处优化”的目标；后续可加入更细粒度的属性词mask。
+    """
+    # 这里我们没有直接用dataset，是因为cuhkpedes产生的dataset是基于reid_raw的，里面并没有captions_rw字段，所以这里init阶段，我们需要重新自己构建samples内容（也就是dataset）
+    def __init__(self,
+                 noisy_json_path: str,
+                 img_dir: str,
+                 transform=None,
+                 text_length: int = 77,
+                 truncate: bool = True):
+        super().__init__()
+        self.transform = transform
+        self.text_length = text_length
+        self.truncate = truncate
+        self.tokenizer = SimpleTokenizer()
+
+        annos = read_json(noisy_json_path)
+        # 只保留训练split，且要求同时包含 captions 与 captions_rw
+        train_annos = [a for a in annos if a.get('split') == 'train' and 'captions' in a and 'captions_rw' in a]
+
+        self.samples = [] # 存储所有样本的列表
+        image_id = 0
+        for anno in train_annos:
+            pid = int(anno['id']) - 1  # 训练pid从0开始
+            img_path = osp.join(img_dir, anno['file_path'])
+            clean_caps = anno['captions']
+            noisy_caps = anno['captions_rw']
+            m = min(len(clean_caps), len(noisy_caps)) # 对齐：按索引一一对应
+            # training时的dataset应当将captions全部展开为独立样本，这与cuhkpedes.py中train下的dataset思路一致
+            for i in range(m):
+                self.samples.append((pid, image_id, img_path, clean_caps[i], noisy_caps[i]))
+            image_id += 1
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        pid, image_id, img_path, clean_cap, noisy_cap = self.samples[index]
+
+        img = read_image(img_path)
+        if self.transform is not None:
+            img = self.transform(img)
+
+            # 为了更稳健地识别哪些词被替换，我们首先在词(level)层面进行对齐，
+            # 然后将被判定为替换的词映射回它们对应的token id范围，生成token-level的noise_labels。
+
+            # 1) 词级切分（保留字母/数字的词）
+            word_pattern = r"[A-Za-z0-9]+|[^\sA-Za-z0-9]+" # 
+            clean_words = re.findall(word_pattern, clean_cap)
+            noisy_words = re.findall(word_pattern, noisy_cap)
+
+            # 2) 使用SequenceMatcher对词序列进行对齐，标记 noisy_words 中的 replace/insert 操作为噪声
+            matcher = difflib.SequenceMatcher(a=clean_words, b=noisy_words)
+            noise_word_flags = [0] * len(noisy_words) # 初始化全0标记
+            # tag的类型可以是'replace','delete','insert','equal'，[i1,i2]是clean_words中的索引范围，[j1,j2]是noisy_words中的索引范围，举例运行过程
+            # 开始部分相同，('equal', 0, 10, 0, 10) "The man is facing away and walking forward. He has a"
+            # # 第一个差异：black backpack → brown shoulder bag ('replace', 10, 12, 10, 13)  clean[10:12] = ['black', 'backpack']  noisy[10:13] = ['brown', 'shoulder', 'bag']
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                # tag in ('replace','delete','insert','equal')
+                if tag == 'replace' or tag == 'insert': # 我们当前的模式只用到replace
+                    # noisy words in [j1, j2) are considered modified/noisy
+                    for j in range(j1, j2):
+                        noise_word_flags[j] = 1 
+
+            # 3) 将 noisy_words 按词逐个 token 化，并记录每个词对应的 token id 范围
+            sot = self.tokenizer.encoder.get("<|startoftext|>")
+            eot = self.tokenizer.encoder.get("<|endoftext|>")
+
+            noisy_token_ids = []
+            word_to_token_span = []  # list of (start_idx, end_idx) in noisy_token_ids for each noisy_word
+            cur = 0
+            for w in noisy_words:
+                # encode 单词
+                token_ids = self.tokenizer.encode(w)
+                noisy_token_ids.extend(token_ids)
+                word_to_token_span.append((cur, cur + len(token_ids)))
+                cur += len(token_ids)
+            # 上面这一步可以得到 noisy_token_ids = [1000, 2000, 3000, 4000, 5000]word_to_token_span = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+
+            # 构造带special tokens的最终token序列，并截断/填充到text_length
+            tokens = [sot] + noisy_token_ids + [eot]
+            if len(tokens) > self.text_length:
+                tokens = tokens[:self.text_length]
+                tokens[-1] = eot
+            tokens_tensor = torch.zeros(self.text_length, dtype=torch.long)
+            tokens_tensor[:len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+
+            # 4) 生成 token-level 的 noise_labels（默认全0），并将被标注为噪声的词对应的token位置设为1
+            # 前面的noise_word_flags是以词为单位标注的，但是一个word可能对应多个token，所以这里我们构建token级的noise_labels用到了word_to_token_span
+            noise_labels = torch.zeros(self.text_length, dtype=torch.long)
+            for wi, flag in enumerate(noise_word_flags):
+                if flag == 1 and wi < len(word_to_token_span):
+                    start, end = word_to_token_span[wi]
+                    # token indices in tokens_tensor are offset by +1 because of sot at position 0
+                    t_start = 1 + start # 这里的1是因为开头的<sot>占了一个位置
+                    t_end = 1 + end
+                    # clip to text_length
+                    t_start = min(t_start, self.text_length)
+                    t_end = min(t_end, self.text_length)
+                    if t_start < t_end:
+                        noise_labels[t_start:t_end] = 1
+
+            # attribute_mask：目前与noise_labels一致（仅在检测到差异的token上计算损失）
+            attribute_mask = noise_labels.clone().float()
+
+            noisy_tokens = tokens_tensor
+
+        ret = {
+            'pids': pid,
+            'image_ids': image_id,
+            'images': img,
+            'caption_ids': noisy_tokens,     # 输入使用带噪声的tokens
+            'noise_labels': noise_labels,    # 监督：1=噪声token位置
+            'attribute_mask': attribute_mask # 仅在差异位置计算loss
+        }
+
+        return ret

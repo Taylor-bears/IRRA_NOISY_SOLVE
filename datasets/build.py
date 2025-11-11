@@ -8,7 +8,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from utils.comm import get_world_size
 
-from .bases import ImageDataset, TextDataset, ImageTextDataset, ImageTextMLMDataset
+from .bases import ImageDataset, TextDataset, ImageTextDataset, ImageTextMLMDataset, ImageTextNoiseDetectionDataset
 
 from .cuhkpedes import CUHKPEDES
 from .icfgpedes import ICFGPEDES
@@ -121,15 +121,29 @@ def build_dataloader(args, tranforms=None):
                                             is_train=True)
         val_transforms = build_transforms(img_size=args.img_size,
                                           is_train=False)
-        # 根据是否启用MLM选择不同的数据集类（来自于bases定义）
-        if args.MLM:
-            train_set = ImageTextMLMDataset(dataset.train,
-                                     train_transforms,
-                                     text_length=args.text_length)
+        # 根据不同任务选择数据集
+        if args.noise_detection and args.noisy_train_json: # new
+            logger.info(f'Using noise detection dataset from: {args.noisy_train_json}')
+            # noisy json 中的 file_path 是相对路径，需要使用原始 CUHK-PEDES 图像根目录
+            img_root = dataset.img_dir if hasattr(dataset, 'img_dir') else ''
+            train_set = ImageTextNoiseDetectionDataset(
+                noisy_json_path=args.noisy_train_json,
+                img_root=img_root,
+                transform=train_transforms,
+                text_length=args.text_length
+            )
+        elif args.MLM:
+            train_set = ImageTextMLMDataset(
+                dataset.train,
+                train_transforms,
+                text_length=args.text_length
+            )
         else:
-            train_set = ImageTextDataset(dataset.train,
-                                     train_transforms,
-                                     text_length=args.text_length)
+            train_set = ImageTextDataset(
+                dataset.train,
+                train_transforms,
+                text_length=args.text_length
+            )
         
         # 使用 "identity" 采样器，按身份/ID采样
         if args.sampler == 'identity': 
