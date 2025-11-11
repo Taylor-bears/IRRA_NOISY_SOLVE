@@ -24,3 +24,12 @@ venv/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 训练日志和输出
+logs/
+outputs/
+results/
+runs/
+tensorboard/
+wandb/
+lightning_logs/

@@ -34,8 +34,38 @@ def get_args():
     parser.add_argument("--noise_loss_weight", type=float, default=1.0, help='loss weight for noise detection (token-level)')
     parser.add_argument("--noisy_train_json", type=str, default='', help='path to noisy train json containing captions_rw field')
     # 测试时掩码噪声token
-    parser.add_argument("--mask_noise_at_test", default=False, action='store_true', help='predict and mask noise tokens at test-time when noise_detection head exists')
-    
+    parser.add_argument(
+        "--mask_noise_at_test",
+        default=False,
+        action="store_true",
+        help="predict and mask noise tokens at test-time when noise_detection head exists",
+    )
+    # 测试时掩码参数（可调）
+    parser.add_argument(
+        "--mask_topk",
+        type=int,
+        default=5,
+        help="Top-K gallery to build pseudo image context for noise prediction，选择前K个最相似的图像序列作为伪图像上下文",
+    )
+    parser.add_argument(
+        "--mask_prob_thresh",
+        type=float,
+        default=0.5,
+        help="probability threshold for masking a token as noise，判断为噪声的概率阈值",
+    )
+    parser.add_argument(
+        "--mask_max_ratio",
+        type=float,
+        default=0.3,
+        help="max ratio of valid tokens to mask to avoid over-masking，比例噪声数量限制",
+    )
+    parser.add_argument(
+        "--mask_max_tokens",
+        type=int,
+        default=12,
+        help="absolute upper bound of tokens to mask per caption; 0 means no explicit cap，绝对噪声数量限制",
+    )
+
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
     parser.add_argument("--stride_size", type=int, default=16)
@@ -53,7 +83,7 @@ def get_args():
     parser.add_argument("--weight_decay_bias", type=float, default=0.)
     parser.add_argument("--alpha", type=float, default=0.9)
     parser.add_argument("--beta", type=float, default=0.999)
-    
+
     ######################## scheduler ########################
     parser.add_argument("--num_epoch", type=int, default=60)
     parser.add_argument("--milestones", type=int, nargs='+', default=(20, 50))

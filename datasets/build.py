@@ -125,10 +125,10 @@ def build_dataloader(args, tranforms=None):
         if args.noise_detection and args.noisy_train_json: # new
             logger.info(f'Using noise detection dataset from: {args.noisy_train_json}')
             # noisy json 中的 file_path 是相对路径，需要使用原始 CUHK-PEDES 图像根目录
-            img_root = dataset.img_dir if hasattr(dataset, 'img_dir') else ''
+            img_dir = dataset.img_dir if hasattr(dataset, 'img_dir') else ''
             train_set = ImageTextNoiseDetectionDataset(
                 noisy_json_path=args.noisy_train_json,
-                img_root=img_root,
+                img_dir=img_dir,
                 transform=train_transforms,
                 text_length=args.text_length
             )
