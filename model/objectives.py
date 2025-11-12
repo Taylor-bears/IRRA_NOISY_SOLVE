@@ -134,7 +134,7 @@ def compute_cmpm(image_embeddings, text_embeddings, labels, epsilon=1e-8):
 
 
 # 噪声检测损失：按token的二分类交叉熵，并通过attribute_mask选择参与监督的token位置
-def compute_noise_detection(noise_logits, noise_labels, attribute_mask):
+def compute_noise_detection(noise_logits, noise_labels, attribute_mask, class_weight=None):
     """
     Args:
         noise_logits: Tensor (B, L, 2) 每个token的二分类logits
@@ -153,7 +153,14 @@ def compute_noise_detection(noise_logits, noise_labels, attribute_mask):
     # 预测正确时：概率接近1 → -log(1)=0 → 损失很小
     # 预测错误时：概率接近0 → -log(0)=∞ → 损失很大
     # 不确定时：概率接近0.5 → -log(0.5)=0.69 → 中等损失
-    per_token_loss = F.cross_entropy(logits, labels, reduction='none')
-    # 按照学长的说法，仅在mask位置累积，目前有mask的位置就是注入噪声的位置
+    if class_weight is not None:
+        # 确保权重在同一设备
+        class_weight = class_weight.to(logits.device)
+        # weight参数给每个类别分配不同的权重，class_weight下我们会加大对噪声类别的关注
+        per_token_loss = F.cross_entropy(logits, labels, reduction='none', weight=class_weight)
+    else:
+        per_token_loss = F.cross_entropy(logits, labels, reduction='none')
+    # 按照学长的说法，仅在mask位置累积
+    # 第一版本下我们的mask只有注入噪声处，我们只考虑正样本的监督；而1.3版本，我们的mask包含所有有效内容处，负样本此时也加入了监督。因为噪声和干净 token 之间是 对立的，而仅凭噪声 token 的学习，模型无法准确判断 干净 token 的特征。通过让模型同时学习如何识别干净 token 和噪声 token，它能够 更好地理解噪声的特征，从而在实际任务中 提升噪声的检测效果。
     loss = (per_token_loss * mask).sum() / (mask.sum() + 1e-8)
     return loss

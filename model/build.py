@@ -209,7 +209,18 @@ class IRRA(nn.Module):
             noise_logits = self.noise_detection_head(fused)  # (B, L, 2)
             noise_labels = batch['noise_labels']  # (B, L)
             attribute_mask = batch.get('attribute_mask', torch.ones_like(noise_labels, dtype=torch.float))
-            noise_loss = objectives.compute_noise_detection(noise_logits.float(), noise_labels, attribute_mask) * getattr(self.args, 'noise_loss_weight', 1.0) # 这里的权重有待调整
+            # 动态类别权重：w_pos = (#neg / #pos)，以提升稀疏正样本的学习信号；若统计异常则回退为None
+            with torch.no_grad():
+                valid = (attribute_mask > 0)
+                pos = ((noise_labels == 1) & valid).sum().item() # 正样本数（噪声）
+                neg = ((noise_labels == 0) & valid).sum().item() # 负样本数
+                if pos > 0 and neg > 0:
+                    w_pos = neg / pos
+                    w_neg = 1.0
+                    class_weight = torch.tensor([w_neg, w_pos], dtype=torch.float, device=noise_labels.device)
+                else:
+                    class_weight = None
+            noise_loss = objectives.compute_noise_detection(noise_logits.float(), noise_labels, attribute_mask, class_weight=class_weight) * getattr(self.args, 'noise_loss_weight', 1.0)
             ret.update({'noise_loss': noise_loss})
 
             # 仅在mask位置统计准确率

@@ -1,5 +1,6 @@
 from typing import List
 from torch.utils.data import Dataset
+import os
 import os.path as osp
 import logging
 import torch
@@ -256,12 +257,32 @@ class ImageTextNoiseDetectionDataset(Dataset):
                  img_dir: str,
                  transform=None,
                  text_length: int = 77,
-                 truncate: bool = True):
+                 truncate: bool = True,
+                 mlm_enable: bool = True,
+                 attribute_vocab_path: str = 'utils/attribute_vocab.txt'):
         super().__init__()
         self.transform = transform
         self.text_length = text_length
         self.truncate = truncate
         self.tokenizer = SimpleTokenizer()
+        # 可选的MLM设置（若启用，则基于clean文本构造MLM样本）
+        self.mlm_enable = mlm_enable
+        # 动态属性词写入：把差异词（clean/noisy）追加写入到该文件，持续扩充词汇库
+        self.attribute_vocab_path = attribute_vocab_path
+        self._written_cache = set()  # 本worker内简单去重，避免重复写爆
+        try:
+            dirpath = osp.dirname(self.attribute_vocab_path)
+            if dirpath and (not osp.exists(dirpath)):
+                os.makedirs(dirpath, exist_ok=True)
+        except Exception:
+            pass
+        # 简易停用词，用于内容词启发式
+        self.stopwords = {
+            'a','an','the','and','or','but','if','while','for','to','of','in','on','at','by','with','from','as','is','are','was','were','be','been','being',
+            'he','she','it','they','them','his','her','their','this','that','these','those','there','here','over','under','up','down','across','into','out','about',
+            'i','you','we','me','us','my','your','our','yours','ours','him','hers','its','who','whom','which','what','when','where','why','how',
+            'very','more','most','so','such','too','just','only','also','not','no','than','then','before','after','again','once'
+        }
 
         annos = read_json(noisy_json_path)
         # 只保留训练split，且要求同时包含 captions 与 captions_rw
@@ -304,12 +325,15 @@ class ImageTextNoiseDetectionDataset(Dataset):
             # tag的类型可以是'replace','delete','insert','equal'，[i1,i2]是clean_words中的索引范围，[j1,j2]是noisy_words中的索引范围，举例运行过程
             # 开始部分相同，('equal', 0, 10, 0, 10) "The man is facing away and walking forward. He has a"
             # # 第一个差异：black backpack → brown shoulder bag ('replace', 10, 12, 10, 13)  clean[10:12] = ['black', 'backpack']  noisy[10:13] = ['brown', 'shoulder', 'bag']
+            replaced_spans = []  # 收集replace片段（clean/noisy）以便写入词表
             for tag, i1, i2, j1, j2 in matcher.get_opcodes():
                 # tag in ('replace','delete','insert','equal')
                 if tag == 'replace': # 我们当前的模式只用到replace
                     # noisy words in [j1, j2) are considered modified/noisy
                     for j in range(j1, j2):
                         noise_word_flags[j] = 1 
+                    # 记录本次差异的clean/noisy词片段
+                    replaced_spans.append((clean_words[i1:i2], noisy_words[j1:j2]))
 
             # 3) 将 noisy_words 按词逐个 token 化，并记录每个词对应的 token id 范围
             sot = self.tokenizer.encoder.get("<|startoftext|>")
@@ -349,8 +373,21 @@ class ImageTextNoiseDetectionDataset(Dataset):
                     if t_start < t_end:
                         noise_labels[t_start:t_end] = 1
 
-            # attribute_mask：目前与noise_labels一致（仅在检测到差异的token上计算损失）
-            attribute_mask = noise_labels.clone().float()
+            # 5) 生成 attribute_mask，现在的mask不仅仅包含差异处，还包含了正样本重要内容处，用于后面算损失时可以动态调整放大噪声损失，因为自身值过于小了
+            # attribute_mask：属性/内容词位置置1，并并入所有正样本（更广覆盖的监督）
+            attribute_mask = torch.zeros(self.text_length, dtype=torch.float)
+            for wi, w in enumerate(noisy_words):
+                base = re.sub(r"[^A-Za-z]+", "", w).lower()
+                # 不再依赖外部属性词库，采用启发式内容词（避免漏检）
+                is_content = base.isalpha() and (len(base) >= 2) and (base not in self.stopwords)
+                if is_content and wi < len(word_to_token_span) and base:
+                    start, end = word_to_token_span[wi]
+                    t_start = min(1 + start, self.text_length)
+                    t_end = min(1 + end, self.text_length)
+                    if t_start < t_end:
+                        attribute_mask[t_start:t_end] = 1.0
+            # 并入正样本位置
+            attribute_mask = torch.where(noise_labels > 0, torch.ones_like(attribute_mask), attribute_mask)
 
             noisy_tokens = tokens_tensor
 
@@ -363,8 +400,79 @@ class ImageTextNoiseDetectionDataset(Dataset):
             'images': img,
             'caption_ids': noisy_tokens,     # 输入使用带噪声的tokens
             'noise_labels': noise_labels,    # 监督：1=噪声token位置
-            'attribute_mask': attribute_mask, # 仅在差异位置计算loss
+            'attribute_mask': attribute_mask, # 关注的token位置（属性/内容词+正样本）
             'clean_caption_ids': clean_tokens # clean 文本tokens，用于一致性损失
         }
 
+        # 可选：为clean文本生成MLM样本（与IRRA原生MLM一致，保持clean基础）
+        if self.mlm_enable:
+            mlm_ids, mlm_labels = self._build_random_masked_tokens_and_labels(clean_tokens.clone().cpu().numpy())
+            ret['mlm_ids'] = mlm_ids
+            ret['mlm_labels'] = mlm_labels
+
+        # 将当前样本中的差异词写入 attribute_vocab_path（逐步扩充词汇库）
+        try:
+            if hasattr(self, 'attribute_vocab_path') and self.attribute_vocab_path:
+                self._append_attribute_vocab_from_spans(replaced_spans)
+        except Exception:
+            pass
+
         return ret
+
+    # 构建随机掩码token序列和标签的方法，与上面那个类相同（可用于可选的clean-MLM）
+    def _build_random_masked_tokens_and_labels(self, tokens):
+        mask = self.tokenizer.encoder["<|mask|>"]
+        token_range = list(range(1, len(self.tokenizer.encoder)-3)) # 1 ~ 49405
+        
+        labels = []
+        # tokens是一个ID序列，token是某一个id，这里用mask对随机id替换
+        for i, token in enumerate(tokens):
+            if 0 < token < 49405:
+                prob = random.random() #生成一个​[0.0, 1.0)内的浮点数
+                # 15%概率选中当前token进行掩码
+                if prob < 0.15:
+                    prob /= 0.15 # 归一化到[0,1]
+
+                    # 80%概率替换为[MASK]
+                    if prob < 0.8:
+                        tokens[i] = mask
+
+                    # 10%概率替换为随机token,从 token_range列表中​随机选择一个元素
+                    elif prob < 0.9:
+                        tokens[i] = random.choice(token_range)
+
+                    # 剩余10%保持原token不变
+
+                    # 记录原始token作为标签
+                    labels.append(token)
+                else:
+                    # 非掩码位置标签为0（计算损失时忽略）
+                    labels.append(0)
+            else:
+                labels.append(0) # 特殊token不参与MLM
+        
+        # 确保至少掩码一个token（避免全零标签）
+        if all(l == 0 for l in labels):
+            # at least mask 1
+            labels[1] = tokens[1]
+            tokens[1] = mask
+
+        return torch.tensor(tokens), torch.tensor(labels)
+
+    def _append_attribute_vocab_from_spans(self, replaced_spans):
+        """
+        将 replace 操作中的 clean/noisy 词片段逐词写入到 attribute_vocab_path。
+        仅写入基础字母词（去除非字母字符，小写化），并做本worker内去重。
+        """
+        if not replaced_spans:
+            return
+        lines = []
+        for clean_seg, noisy_seg in replaced_spans:
+            for w in list(clean_seg) + list(noisy_seg):
+                base = re.sub(r"[^A-Za-z]+", "", w).lower()
+                if base and (base not in self._written_cache):
+                    self._written_cache.add(base)
+                    lines.append(base + "\n")
+        if lines:
+            with open(self.attribute_vocab_path, 'a', encoding='utf-8') as f:
+                f.writelines(lines)
