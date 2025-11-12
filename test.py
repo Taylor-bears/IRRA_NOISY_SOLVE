@@ -30,6 +30,12 @@ if __name__ == "__main__":
     parser.add_argument("--mask_prob_thresh", type=float, default=None)
     parser.add_argument("--mask_max_ratio", type=float, default=None)
     parser.add_argument("--mask_max_tokens", type=int, default=None)
+    parser.add_argument("--mask_strategy", type=str, default=None)
+    parser.add_argument("--mask_soft_alpha_cap", type=float, default=None)
+    parser.add_argument("--noise_ctx", type=str, default=None)
+    parser.add_argument("--enable_attribute_filter", dest="enable_attribute_filter", action="store_true")
+    parser.add_argument("--no-enable_attribute_filter", dest="enable_attribute_filter", action="store_false")
+    parser.add_argument("--attribute_vocab_path", type=str, default=None)
     parser.set_defaults(mask_noise_at_test=None)
     cli_args = parser.parse_args()
     args = load_train_configs(cli_args.config_file)
@@ -46,6 +52,16 @@ if __name__ == "__main__":
         args.mask_max_ratio = float(cli_args.mask_max_ratio)
     if cli_args.mask_max_tokens is not None:
         args.mask_max_tokens = int(cli_args.mask_max_tokens)
+    if cli_args.mask_strategy is not None:
+        args.mask_strategy = str(cli_args.mask_strategy)
+    if cli_args.mask_soft_alpha_cap is not None:
+        args.mask_soft_alpha_cap = float(cli_args.mask_soft_alpha_cap)
+    if cli_args.noise_ctx is not None:
+        args.noise_ctx = str(cli_args.noise_ctx)
+    if cli_args.enable_attribute_filter is not None:
+        args.enable_attribute_filter = bool(cli_args.enable_attribute_filter)
+    if cli_args.attribute_vocab_path is not None:
+        args.attribute_vocab_path = str(cli_args.attribute_vocab_path)
 
     logger = setup_logger("IRRA", save_dir=args.output_dir, if_train=args.training)
     logger.info(args)

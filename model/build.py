@@ -127,12 +127,23 @@ class IRRA(nn.Module):
         # 获取输入数据
         images = batch['images']
         caption_ids = batch['caption_ids']
-        # 提取图像和文本特征（通过CLIP基模型）
-        image_feats, text_feats = self.base_model(images, caption_ids)
+        # 提取图像和文本特征（通过CLIP基模型）。若指定使用干净文本进行主检索/ID损失，则在此处替换。
+        use_clean_for_retrieval = getattr(self.args, 'use_clean_for_retrieval', False)
+        clean_ids = batch.get('clean_caption_ids', None) if use_clean_for_retrieval else None
+        if clean_ids is not None:
+            # 1) 主干损失使用 clean 文本；2) 噪声检测仍使用 noisy 对应的 text_feats (后面单独再编码)
+            image_feats, clean_text_feats = self.base_model(images, clean_ids)
+            # 供主任务句向量
+            text_feats_for_main = clean_text_feats
+        else:
+            image_feats, text_feats = self.base_model(images, caption_ids)
+            text_feats_for_main = text_feats
         # 提取有效特征
         i_feats = image_feats[:, 0, :].float()
         # i_feats = image_feats.float() # for CLIP ResNet visual model
-        t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+        # 句向量：依据主任务所选用的文本序列
+        main_ids = clean_ids if clean_ids is not None else caption_ids
+        t_feats = text_feats_for_main[torch.arange(text_feats_for_main.shape[0]), main_ids.argmax(dim=-1)].float()
         # 温度参数
         logit_scale = self.logit_scale
         ret.update({'temperature': 1 / logit_scale})
@@ -186,9 +197,14 @@ class IRRA(nn.Module):
         # 噪声检测分支（token-level 二分类）：输入为噪声文本与对应图像
         if getattr(self.args, 'noise_detection', False) and ('noise_labels' in batch): # new
             # 使用原始caption_ids（噪声文本）对应的文本序列特征作为query
-            # text_feats 来自 self.base_model(images, caption_ids) 已计算，为整序列 (B, L, D)
+            # 若主任务用了 clean 文本，则此处需要重新编码 noisy 文本序列
+            if clean_ids is not None:
+                noisy_seq = self.base_model.encode_text(caption_ids)  # (B, L, D)
+                text_feats_noisy_seq = noisy_seq
+            else:
+                text_feats_noisy_seq = text_feats  # (B, L, D)
             # 跨模态融合：文本特征作为query，图像特征作为key和value
-            fused = self.cross_former(text_feats, image_feats, image_feats)  # (B, L, D)
+            fused = self.cross_former(text_feats_noisy_seq, image_feats, image_feats)  # (B, L, D)
             # 噪声检测头部：每个token位置进行二分类（噪声/干净）
             noise_logits = self.noise_detection_head(fused)  # (B, L, 2)
             noise_labels = batch['noise_labels']  # (B, L)
@@ -205,6 +221,27 @@ class IRRA(nn.Module):
                 else:
                     acc = torch.tensor(0.0, device=pred.device)
             ret.update({'noise_acc': acc})
+
+        # 一致性损失：clean vs noisy 文本（同一图像）句向量应接近
+        # 它的作用在于让同一张图的 clean 文本与 noisy 文本的句向量尽量一致，降低模型对“属性替换”噪声的敏感度。
+        cons_w = getattr(self.args, 'consistency_loss_weight', 0.0)
+        if cons_w > 0.0 and ('clean_caption_ids' in batch):
+            clean_ids = batch['clean_caption_ids']
+            clean_feats_seq = self.base_model.encode_text(clean_ids)  # (B, L, D)
+            # 提取每个样本或者每个cap对应[EOS]位置的向量
+            z_clean = clean_feats_seq[torch.arange(clean_feats_seq.shape[0]), clean_ids.argmax(dim=-1)].float()
+            # 使用当前 noisy 句向量 t_feats
+            # 余弦一致性损失：1 - cos
+            zc = torch.nn.functional.normalize(z_clean, dim=1) # 干净归一化
+            # 一致性是对 noisy vs clean 对齐，因此若主任务用 clean，需要单独编码 noisy 句向量（避免恒等）
+            if clean_ids is not None:
+                noisy_seq_for_cons = self.base_model.encode_text(caption_ids)
+                noisy_sent = noisy_seq_for_cons[torch.arange(noisy_seq_for_cons.shape[0]), caption_ids.argmax(dim=-1)].float()
+                zn = torch.nn.functional.normalize(noisy_sent, dim=1)
+            else:
+                zn = torch.nn.functional.normalize(t_feats, dim=1) # 有噪归一化
+            cons_loss = (1.0 - (zc * zn).sum(dim=1)).mean() * cons_w # 计算余弦相似度
+            ret.update({'consistency_loss': cons_loss})
 
         return ret # 返回所有损失和指标
 

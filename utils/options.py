@@ -32,7 +32,9 @@ def get_args():
     # 噪声检测任务相关设置
     parser.add_argument("--noise_detection", default=False, action='store_true', help='enable noise token detection task; replaces mlm prediction with token-level noise classification')
     parser.add_argument("--noise_loss_weight", type=float, default=1.0, help='loss weight for noise detection (token-level)')
+    parser.add_argument("--noise_warmup_epochs", type=int, default=5, help='warmup epochs for noise loss (effective weight ramps from 0 to noise_loss_weight)')
     parser.add_argument("--noisy_train_json", type=str, default='', help='path to noisy train json containing captions_rw field')
+    parser.add_argument("--consistency_loss_weight", type=float, default=0.0, help='weight for clean vs noisy text embedding consistency')
     # 测试时掩码噪声token
     parser.add_argument(
         "--mask_noise_at_test",
@@ -64,6 +66,60 @@ def get_args():
         type=int,
         default=12,
         help="absolute upper bound of tokens to mask per caption; 0 means no explicit cap，绝对噪声数量限制",
+    )
+    parser.add_argument(
+        "--mask_strategy",
+        type=str,
+        choices=['hard', 'soft', 'none'],
+        default='hard',
+        help="token masking strategy at test: hard=replace <|mask|>, soft=weighted blend, none=disable masking，表示测试时的token掩码策略",
+    )
+    parser.add_argument(
+        "--mask_soft_alpha_cap",
+        type=float,
+        default=0.3,
+        help="maximum weight reduction for soft masking (controls how much to down-weight noisy tokens)，表示软掩码中最大权重降低值",
+    )
+    parser.add_argument(
+        "--noise_ctx",
+        type=str,
+        choices=['topk_mean', 'none', 'topk_vote'],
+        default='topk_mean',
+        help="context type for noise prediction: topk_mean=mean of Top-K gallery seq, none=no image context, topk_vote=per-image prediction then prob average (ensemble)" ,
+    )
+    parser.add_argument(
+        "--enable_attribute_filter",
+        action='store_true',
+        help="enable attribute vocabulary filtering when masking (only tokens whose decoded piece matches an attribute word can be masked)，表示是否启用属性词汇过滤",
+    )
+    parser.add_argument(
+        "--attribute_vocab_path",
+        type=str,
+        default="utils/attribute_vocab.txt",
+        help="path to attribute vocabulary list (one word per line) used when --enable_attribute_filter is set，表示属性词汇表路径",
+    )
+    parser.add_argument(
+        "--use_clean_for_retrieval",
+        action='store_true',
+        help="use clean caption (if available) for retrieval/id losses while keeping noisy caption for noise detection & consistency，是否在检索/ID损失使用干净文本"
+    )
+    parser.add_argument(
+        "--noise_start_epoch",
+        type=int,
+        default=0,
+        help="epoch index (1-based) at which to start applying noise loss warmup; before this epoch noise loss weight=0，噪声损失开始参与的epoch编号(从1开始)"
+    )
+    parser.add_argument(
+        "--consistency_warmup_epochs",
+        type=int,
+        default=0,
+        help="warmup epochs for consistency loss (0=disable warmup)，一致性损失的预热轮数"
+    )
+    parser.add_argument(
+        "--consistency_start_epoch",
+        type=int,
+        default=0,
+        help="epoch index (1-based) to start applying consistency loss; before this epoch consistency loss weight=0，一致性损失开始参与的epoch编号(从1开始)"
     )
 
     ######################## vison trainsformer settings ########################

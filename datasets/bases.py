@@ -306,7 +306,7 @@ class ImageTextNoiseDetectionDataset(Dataset):
             # # 第一个差异：black backpack → brown shoulder bag ('replace', 10, 12, 10, 13)  clean[10:12] = ['black', 'backpack']  noisy[10:13] = ['brown', 'shoulder', 'bag']
             for tag, i1, i2, j1, j2 in matcher.get_opcodes():
                 # tag in ('replace','delete','insert','equal')
-                if tag == 'replace' or tag == 'insert': # 我们当前的模式只用到replace
+                if tag == 'replace': # 我们当前的模式只用到replace
                     # noisy words in [j1, j2) are considered modified/noisy
                     for j in range(j1, j2):
                         noise_word_flags[j] = 1 
@@ -354,13 +354,17 @@ class ImageTextNoiseDetectionDataset(Dataset):
 
             noisy_tokens = tokens_tensor
 
+            # 额外：构造 clean 文本的 token 序列（用于一致性损失）
+            clean_tokens = tokenize(clean_cap, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
+
         ret = {
             'pids': pid,
             'image_ids': image_id,
             'images': img,
             'caption_ids': noisy_tokens,     # 输入使用带噪声的tokens
             'noise_labels': noise_labels,    # 监督：1=噪声token位置
-            'attribute_mask': attribute_mask # 仅在差异位置计算loss
+            'attribute_mask': attribute_mask, # 仅在差异位置计算loss
+            'clean_caption_ids': clean_tokens # clean 文本tokens，用于一致性损失
         }
 
         return ret

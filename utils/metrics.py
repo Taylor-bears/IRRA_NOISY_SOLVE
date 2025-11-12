@@ -87,7 +87,8 @@ class Evaluator:
 
         # 打印一次测试时掩码配置，便于排查是否真的生效
         if self.mask_noise:
-            self.logger.info(f"[Eval] mask_noise_at_test=True ")
+            args_obj = getattr(model, 'args', object())
+            self.logger.info(f"[Eval] mask_noise_at_test=True strategy={getattr(args_obj,'mask_strategy','hard')} ctx={getattr(args_obj,'noise_ctx','topk_mean')} topk={getattr(args_obj,'mask_topk',5)}")
         else:
             self.logger.info("[Eval] mask_noise_at_test=False (no token masking)")
 
@@ -102,111 +103,186 @@ class Evaluator:
             tokenizer = SimpleTokenizer()
             mask_token_id = tokenizer.encoder.get("<|mask|>")
             eot_token_id = tokenizer.encoder.get("<|endoftext|>")
+            # 属性词过滤：仅当开启时才生效
+            args_obj = getattr(model, 'args', object())
+            enable_attr_filter = getattr(args_obj, 'enable_attribute_filter', False)
+            attr_set = set()
+            if enable_attr_filter:
+                vocab_path = getattr(args_obj, 'attribute_vocab_path', 'utils/attribute_vocab.txt')
+                try:
+                    with open(vocab_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            w = line.strip().lower()
+                            if w:
+                                attr_set.add(w)
+                    self.logger.info(f"[Eval] Attribute filter enabled; loaded {len(attr_set)} words from {vocab_path}")
+                except Exception as e:
+                    self.logger.warning(f"[Eval] Attribute vocab not loaded from {vocab_path}: {e}; disabling filter")
+                    enable_attr_filter = False
+
+            def _allowed_token(token_id: int) -> bool:
+                if not enable_attr_filter:
+                    return True
+                # 根据token_id从tokenizer的解码器中查找对应的文本内容
+                tok = tokenizer.decoder.get(int(token_id), '')
+                # 去除token中的词尾标记'</w>'
+                base = tok.replace('</w>', '')
+                # 遍历每个字符，只保留字母字符
+                base = ''.join([c for c in base if c.isalpha()]).lower()
+                # 仅允许长度>=3的字母词，且在属性词表
+                return (len(base) >= 3) and (base in attr_set)
 
         # ===== 文本特征提取阶段 =====
         for pid, caption in self.txt_loader:
             caption = caption.to(device)
-            if (
-                self.mask_noise
-                and (image_seq_feats_cat is not None)
-                and hasattr(model, "noise_detection_head")
-            ):
+            if self.mask_noise and hasattr(model, 'noise_detection_head'):
                 with torch.no_grad():
-                    # 步骤1: 先用未掩码文本做一次粗检索，选取Top-K gallery图像序列作为伪图像上下文
-                    text_feat_nomask = model.encode_text(caption)  # (B, D)
-                    text_feat_nomask_n = F.normalize(text_feat_nomask, p=2, dim=1)
-                    # 计算文本与所有图像的相似度
-                    sim = text_feat_nomask_n @ gfeats_norm.t()  # (B, N_gallery)
-                    # 使用可调的Top-K（默认5）
-                    k_cfg = getattr(getattr(model, "args", object()), "mask_topk", 5)
-                    k = min(k_cfg if k_cfg > 0 else 5, gfeats_norm.size(0))
-                    # 获取每个查询最相似的k个图像索引
-                    topk_idx = torch.topk(
-                        sim, k=k, dim=1, largest=True, sorted=True
-                    ).indices  # (B, k)
-
-                    # 步骤2: 按样本组装伪图像序列：对每个query取Top-K图像序列的均值
-                    Bq = caption.size(0)  # batch大小
-                    L_img = image_seq_feats_cat.size(1)  # 图像序列长度
-                    D = image_seq_feats_cat.size(2)  # 特征维度
-                    # 创建伪图像序列容器
-                    pseudo_img = torch.empty(
-                        (Bq, L_img, D), device=device, dtype=image_seq_feats_cat.dtype
-                    )
-                    # 为每个查询样本构造个性化的伪图像特征
-                    for b in range(Bq):
-                        seqs = image_seq_feats_cat[topk_idx[b]]  # (k, L_img, D)
-                        pseudo_img[b] = seqs.mean(
-                            0
-                        )  # 对k个图像序列取平均，得到个性化伪图像
-
-                    # 步骤3: 跨模态融合并进行噪声分类
-                    seq_text_feats = model.base_model.encode_text(
-                        caption
-                    )  # (B, L_t, D)
-                    fused = model.cross_former(
-                        seq_text_feats, pseudo_img, pseudo_img
-                    )  # (B, L_t, D)
-                    noise_logits = model.noise_detection_head(
-                        fused
-                    )  # 噪声分类 (B, L_t, 2)
-                    prob = torch.softmax(noise_logits, dim=-1)[
-                        ..., 1
-                    ]  # 噪声概率 (B, L_t)
-
-                    # 步骤4: 应用掩码：置信度阈值与最大掩码比例保护
-                    masked_caption = caption.clone()
-                    B, L = masked_caption.size()
-                    # 获取掩码参数配置
-                    args_obj = getattr(model, "args", object())
-                    prob_thresh = getattr(args_obj, "mask_prob_thresh", 0.5)
-                    max_ratio = getattr(args_obj, "mask_max_ratio", 0.3)
-                    max_tokens_cap = getattr(args_obj, "mask_max_tokens", 0)
-                    for b in range(B):
-                        # 确定有效范围 [1, end_pos)，跳过特殊token（起始/结束标记）
-                        end_pos = L - 1
-                        if eot_token_id is not None:
-                            eot_positions = (masked_caption[b] == eot_token_id).nonzero(
-                                as_tuple=False
-                            )
-                            if eot_positions.numel() > 0:
-                                end_pos = int(eot_positions[0].item())
-                        valid_range = (1, max(1, end_pos))
-                        if (
-                            valid_range[1] <= valid_range[0]
-                        ):  # [0]是起始位置，[1]是结束位置
-                            continue
-
-                        # 根据概率筛选候选，并按概率排序，限制最大掩码比例
-                        cand_idx = torch.arange(
-                            valid_range[0], valid_range[1], device=device
-                        )
-                        cand_prob = prob[b, cand_idx]  # 获取有效位置的噪声概率
-                        keep = (
-                            cand_prob > prob_thresh
-                        )  # 保留超过阈值的候选（因为为噪声概率不高的，就几乎不会是噪声，对应位置直接按干净处理）
-                        if keep.any():
-                            cand_idx = cand_idx[keep]  # 过滤后的候选索引
-                            cand_prob = cand_prob[keep]  # 过滤后的概率
-                            # 降序排序，优先掩码高置信度token
-                            sorted_prob, order = torch.sort(cand_prob, descending=True)
-                            cand_idx = cand_idx[order]
-                            # 计算最大允许掩码数（比例限制和绝对数量限制）
-                            max_mask_ratio = max(
-                                1, int((valid_range[1] - valid_range[0]) * max_ratio)
-                            )  # 比例限制
-                            if max_tokens_cap > 0:  # 绝对限制
-                                max_mask = min(max_mask_ratio, max_tokens_cap)
-                            else:
-                                max_mask = max_mask_ratio
-                            # 截取前max_mask个候选
-                            cand_idx = cand_idx[:max_mask]
-                            # 应用掩码：将噪声token替换为[MASK]
-                            for t in cand_idx.tolist():
-                                if masked_caption[b, t] != 0:
-                                    masked_caption[b, t] = mask_token_id
-                    # 步骤5: 使用掩码后的文本提取最终特征
-                    text_feat = model.encode_text(masked_caption)
+                    args_obj = getattr(model, 'args', object())
+                    # 获取上下文模式配置，默认为'topk_mean'
+                    ctx_mode = getattr(args_obj, 'noise_ctx', 'topk_mean')
+                    seq_text_feats = model.base_model.encode_text(caption)  # (B, L_t, D)
+                    if ctx_mode == 'none' or image_seq_feats_cat is None:
+                        # 直接使用文本序列特征，不进行跨模态融合
+                        fused = seq_text_feats
+                        noise_logits = model.noise_detection_head(fused)
+                        prob = torch.softmax(noise_logits, dim=-1)[..., 1]
+                    else:
+                        # 提取未掩码的文本全局特征
+                        text_feat_nomask = model.encode_text(caption)  # (B, D)
+                        text_feat_nomask_n = F.normalize(text_feat_nomask, p=2, dim=1)
+                        # 计算文本特征与所有图库图像特征的相似度矩阵
+                        sim = text_feat_nomask_n @ gfeats_norm.t()  # (B, N_gallery)
+                        # 获取配置的Top-K值
+                        k_cfg = getattr(args_obj, 'mask_topk', 5)
+                        # 计算实际的K值，确保不超过图库大小
+                        k = min(k_cfg if k_cfg > 0 else 5, gfeats_norm.size(0))
+                        # 获取相似度最高的K个图像的索引
+                        topk_idx = torch.topk(sim, k=k, dim=1, largest=True, sorted=True).indices  # (B, k)
+                        Bq = caption.size(0)
+                        L_img = image_seq_feats_cat.size(1)
+                        D = image_seq_feats_cat.size(2)
+                        if ctx_mode == 'topk_vote':
+                            # K个图像 → K次融合 → K次预测 → 概率平均
+                            # 针对每个Top-K图像，分别计算噪声概率，然后对概率做平均（或投票）
+                            vote_probs = []
+                            for kk in range(k):
+                                # 批量取出每个样本对应的第kk个Top-K图像序列特征来和文本融合
+                                sel_seq = image_seq_feats_cat[topk_idx[:, kk]]  # (B, L_img, D)
+                                fused_k = model.cross_former(seq_text_feats, sel_seq, sel_seq)  # (B, L_t, D)
+                                logits_k = model.noise_detection_head(fused_k)
+                                prob_k = torch.softmax(logits_k, dim=-1)[..., 1]  # (B, L_t)
+                                vote_probs.append(prob_k) # 收集每个Top-K图像对应的噪声概率
+                            prob = torch.stack(vote_probs, dim=0).mean(0)  # (B, L_t)
+                        else:
+                            # 默认 topk_mean：先对Top-K图像序列取均值，再一次融合预测
+                            # K个图像 → 平均 → 1次融合 → 1次预测
+                            # 创建空的伪图像特征张量
+                            pseudo_img = torch.empty((Bq, L_img, D), device=device, dtype=image_seq_feats_cat.dtype)
+                            for b in range(Bq):
+                                # 从图库中获取与当前文本最相似的K个图像的序列特征
+                                seqs = image_seq_feats_cat[topk_idx[b]]  # (k, L_img, D)
+                                # 对K个图像的序列特征求平均，得到伪图像上下文
+                                pseudo_img[b] = seqs.mean(0)
+                            fused = model.cross_former(seq_text_feats, pseudo_img, pseudo_img)  # (B, L_t, D)
+                            noise_logits = model.noise_detection_head(fused)
+                            prob = torch.softmax(noise_logits, dim=-1)[..., 1]  # (B, L_t)
+                    strategy = getattr(args_obj, 'mask_strategy', 'hard')
+                    prob_thresh = getattr(args_obj, 'mask_prob_thresh', 0.5)
+                    max_ratio = getattr(args_obj, 'mask_max_ratio', 0.3)
+                    max_tokens_cap = getattr(args_obj, 'mask_max_tokens', 0)
+                    alpha_cap = getattr(args_obj, 'mask_soft_alpha_cap', 0.3)
+                    B, L = caption.size()
+                    # 根据不同的掩码策略进行处理
+                    if strategy == 'none':
+                        # 不进行任何掩码，直接使用原始文本提取特征
+                        text_feat = model.encode_text(caption)
+                    elif strategy == 'hard':
+                        # 硬掩码策略：直接将噪声token替换为[MASK]
+                        masked_caption = caption.clone()
+                        for b in range(B):
+                            end_pos = L - 1
+                            # 找到结束标记位置，限定有效范围
+                            if eot_token_id is not None:
+                                eot_positions = (masked_caption[b] == eot_token_id).nonzero(as_tuple=False)
+                                if eot_positions.numel() > 0:
+                                    end_pos = int(eot_positions[0].item())
+                            valid_range = (1, max(1, end_pos)) # [0]为开头，[1]为结束
+                            if valid_range[1] <= valid_range[0]:
+                                continue
+                            cand_idx = torch.arange(valid_range[0], valid_range[1], device=device)
+                            # 获取有效位置的噪声概率
+                            cand_prob = prob[b, cand_idx]
+                            # 属性词过滤
+                            if enable_attr_filter:
+                                allow_mask = []
+                                for t_id in caption[b, cand_idx].tolist():
+                                    allow_mask.append(_allowed_token(int(t_id)))
+                                allow_mask = torch.tensor(allow_mask, device=device, dtype=torch.bool)
+                                cand_idx = cand_idx[allow_mask]
+                                cand_prob = cand_prob[allow_mask]
+                            # 筛选出超过噪声阈值的token
+                            keep = cand_prob > prob_thresh
+                            if keep.any():
+                                cand_idx = cand_idx[keep]
+                                cand_prob = cand_prob[keep]
+                                # 按概率降序排序
+                                sorted_prob, order = torch.sort(cand_prob, descending=True)
+                                # 重新排列索引
+                                cand_idx = cand_idx[order]
+                                # 计算最大掩码数量（基于比例）
+                                max_mask_ratio = max(1, int((valid_range[1]-valid_range[0]) * max_ratio))
+                                # 计算实际的最大掩码数量，受比例和绝对数量的限制
+                                max_mask = min(max_mask_ratio, max_tokens_cap) if max_tokens_cap > 0 else max_mask_ratio
+                                cand_idx = cand_idx[:max_mask]
+                                for t in cand_idx.tolist():
+                                    if masked_caption[b, t] != 0 and mask_token_id is not None:
+                                        # 将token替换为掩码token
+                                        masked_caption[b, t] = mask_token_id
+                        text_feat = model.encode_text(masked_caption)
+                    else: # soft
+                        # 软掩码策略：对噪声token进行加权处理
+                        seq_text_feats_full = model.base_model.encode_text(caption)  # (B, L, D)
+                        # 初始化权重张量，全为1
+                        weights = torch.ones_like(prob)
+                        for b in range(B):
+                            end_pos = L - 1
+                            if eot_token_id is not None:
+                                eot_positions = (caption[b] == eot_token_id).nonzero(as_tuple=False)
+                                if eot_positions.numel() > 0:
+                                    end_pos = int(eot_positions[0].item())
+                            valid_range = (1, max(1, end_pos))
+                            if valid_range[1] <= valid_range[0]:
+                                continue
+                            cand_idx = torch.arange(valid_range[0], valid_range[1], device=device)
+                            cand_prob = prob[b, cand_idx]
+                            # 属性词过滤
+                            if enable_attr_filter:
+                                allow_mask = []
+                                for t_id in caption[b, cand_idx].tolist():
+                                    allow_mask.append(_allowed_token(int(t_id)))
+                                allow_mask = torch.tensor(allow_mask, device=device, dtype=torch.bool)
+                                cand_idx = cand_idx[allow_mask]
+                                cand_prob = cand_prob[allow_mask]
+                            mask_sel = cand_prob > prob_thresh
+                            if mask_sel.any():
+                                sel_idx = cand_idx[mask_sel]
+                                sel_prob = cand_prob[mask_sel]
+                                max_soft_ratio = max(1, int((valid_range[1]-valid_range[0]) * max_ratio)) 
+                                max_soft = min(max_soft_ratio, max_tokens_cap) if max_tokens_cap > 0 else max_soft_ratio
+                                sorted_p, order = torch.sort(sel_prob, descending=True)
+                                sel_idx = sel_idx[order][:max_soft]
+                                sel_prob = sorted_p[:max_soft]
+                                # 计算软掩码权重（概率越高，权重越低）
+                                alpha = torch.clamp(sel_prob, max=alpha_cap)
+                                # 更新权重张量
+                                weights[b, sel_idx] = 1.0 - alpha
+                        eps = 1e-6
+                        # 在最后一个维度上增加一维，用于广播
+                        weights = weights.unsqueeze(-1)
+                        # 计算加权平均特征
+                        # 使用加权平均融合文本局部特征来获得新的全局文本特征
+                        weighted_feats = (seq_text_feats_full * weights).sum(1) / (weights.sum(1) + eps)
+                        text_feat = weighted_feats.float()
             else:
                 with torch.no_grad():
                     text_feat = model.encode_text(caption)

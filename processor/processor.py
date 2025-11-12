@@ -29,6 +29,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         "id_loss": AverageMeter(),
         "mlm_loss": AverageMeter(),
         "noise_loss": AverageMeter(),
+        "consistency_loss": AverageMeter(),
         "img_acc": AverageMeter(),
         "txt_acc": AverageMeter(),
         "mlm_acc": AverageMeter()
@@ -49,11 +50,47 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         model.train()
 
         # 遍历训练数据
-        for n_iter, batch in enumerate(train_loader):
+        for n_iter, batch in enumerate(train_loader): # n_iter是当前epoch中的迭代次数
             # batch的数据放到GPU上
             batch = {k: v.to(device) for k, v in batch.items()}
             # 前向传播，返回损失和指标
             ret = model(batch)
+            # 动态warmup噪声损失：支持延后起始与线性预热
+            warmup_epochs = getattr(args, 'noise_warmup_epochs', 0) # 表示噪声损失预热多少轮
+            # 表示什么时候开始开启算入噪声损失，目的是为了恢复接近原 IRRA 检索水平，建立稳定的跨模态空间
+            start_epoch_noise = getattr(args, 'noise_start_epoch', 0)
+            if 'noise_loss' in ret:
+                if warmup_epochs <= 0:
+                    # 若不预热但设置了延后起始，则在起始轮前禁用
+                    if start_epoch_noise and epoch < start_epoch_noise:
+                        ret['noise_loss'] = ret['noise_loss'] * 0.0
+                else:
+                    # 在起始轮之前禁用；起始轮到起始轮+warmup线性提升到1
+                    if start_epoch_noise and epoch < start_epoch_noise:
+                        alpha = 0.0
+                    else:
+                        # 计算从起始轮开始的progress
+                        base_epoch = start_epoch_noise if start_epoch_noise else 1
+                        progress = (epoch - base_epoch) + (n_iter + 1) / max(1, len(train_loader))
+                        alpha = min(1.0, max(0.0, progress / max(1e-6, warmup_epochs)))
+                    ret['noise_loss'] = ret['noise_loss'] * alpha
+
+            # 一致性损失：支持“起始轮数 + 线性预热”
+            cons_warmup = getattr(args, 'consistency_warmup_epochs', 0)
+            cons_start = getattr(args, 'consistency_start_epoch', 0)
+            if 'consistency_loss' in ret:
+                if cons_warmup <= 0:
+                    # 无预热则只应用起始轮门控
+                    if cons_start and epoch < cons_start:
+                        ret['consistency_loss'] = ret['consistency_loss'] * 0.0
+                else:
+                    if cons_start and epoch < cons_start:
+                        alpha = 0.0
+                    else:
+                        base_epoch = cons_start if cons_start else 1
+                        progress = (epoch - base_epoch) + (n_iter + 1) / max(1, len(train_loader))
+                        alpha = min(1.0, max(0.0, progress / max(1e-6, cons_warmup)))
+                    ret['consistency_loss'] = ret['consistency_loss'] * alpha
             # 计算总损失
             total_loss = sum([v for k, v in ret.items() if "loss" in k])
             # 更新各项指标
@@ -64,6 +101,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             meters['id_loss'].update(ret.get('id_loss', 0), batch_size)
             meters['mlm_loss'].update(ret.get('mlm_loss', 0), batch_size)
             meters['noise_loss'].update(ret.get('noise_loss', 0), batch_size)
+            meters['consistency_loss'].update(ret.get('consistency_loss', 0), batch_size)
 
             meters['img_acc'].update(ret.get('img_acc', 0), batch_size)
             meters['txt_acc'].update(ret.get('txt_acc', 0), batch_size)
