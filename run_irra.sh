@@ -18,6 +18,7 @@ CUDA_VISIBLE_DEVICES=3 \
 --use_clean_for_retrieval \
 --consistency_loss_weight 0.05 \
 --consistency_start_epoch 8 \
---consistency_warmup_epochs 8
+--consistency_warmup_epochs 8 \
+--eval_impl extended
 
 # --loss_names 'sdm+mlm+id' 暂时先关了mlm

@@ -10,6 +10,6 @@ CUDA_VISIBLE_DEVICES=3 \
 --dataset_name $DATASET_NAME \
 --loss_names 'sdm+mlm+id' \
 --num_epoch 60 \
---use_clean_for_retrieval 
-
+--use_clean_for_retrieval \
+--eval_impl baseline
 # --loss_names 'sdm+mlm+id' 暂时先关了mlm

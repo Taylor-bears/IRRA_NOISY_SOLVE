@@ -12,7 +12,7 @@ from utils.iotools import save_train_configs
 from utils.logger import setup_logger
 from solver import build_optimizer, build_lr_scheduler
 from model import build_model
-from utils.metrics import Evaluator
+from utils.metrics import Evaluator as EvaluatorExtended
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
 
@@ -71,7 +71,12 @@ if __name__ == '__main__':
 
     is_master = get_rank() == 0
     checkpointer = Checkpointer(model, optimizer, scheduler, args.output_dir, is_master) # 管理
-    evaluator = Evaluator(val_img_loader, val_txt_loader) # 验证集评估器
+    # 选择评估器实现：baseline(原IRRA) 或 extended(支持测试期噪声掩码)
+    if getattr(args, 'eval_impl', 'extended') == 'baseline':
+        from utils.metrics_baseline import Evaluator as EvaluatorBaseline
+        evaluator = EvaluatorBaseline(val_img_loader, val_txt_loader)
+    else:
+        evaluator = EvaluatorExtended(val_img_loader, val_txt_loader)
 
     start_epoch = 1
     if args.resume:

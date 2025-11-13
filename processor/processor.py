@@ -2,7 +2,7 @@ import logging
 import time
 import torch
 from utils.meter import AverageMeter
-from utils.metrics import Evaluator
+from utils.metrics import Evaluator as EvaluatorExtended
 from utils.comm import get_rank, synchronize
 from torch.utils.tensorboard import SummaryWriter
 from prettytable import PrettyTable
@@ -180,6 +180,17 @@ def do_inference(model, test_img_loader, test_txt_loader):
     # 初始化评估器（计算Top-1、mAP等指标）
     # 按需启用测试时噪声掩码（从模型参数中读取）
     mask_noise = getattr(getattr(model, 'args', object()), 'mask_noise_at_test', False)
-    evaluator = Evaluator(test_img_loader, test_txt_loader, mask_noise=mask_noise)
+    # 根据实现选择评估器
+    try:
+        from utils.options import get_args as _get_args_for_eval
+        args_obj = getattr(model, 'args', None)
+        eval_impl = getattr(args_obj, 'eval_impl', 'extended') if args_obj else 'extended'
+    except Exception:
+        eval_impl = 'extended'
+    if eval_impl == 'baseline':
+        from utils.metrics_baseline import Evaluator as EvaluatorBaseline
+        evaluator = EvaluatorBaseline(test_img_loader, test_txt_loader)
+    else:
+        evaluator = EvaluatorExtended(test_img_loader, test_txt_loader, mask_noise=mask_noise)
     # 评估模型性能
     top1 = evaluator.eval(model.eval())

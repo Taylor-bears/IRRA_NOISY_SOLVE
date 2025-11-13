@@ -122,6 +122,15 @@ def get_args():
         help="epoch index (1-based) to start applying consistency loss; before this epoch consistency loss weight=0，一致性损失开始参与的epoch编号(从1开始)"
     )
 
+    # 评估器实现选择：baseline(与原IRRA一致) 或 extended(支持测试期噪声掩码)
+    parser.add_argument(
+        "--eval_impl",
+        type=str,
+        choices=["baseline", "extended"],
+        default="extended",
+        help="which evaluator implementation to use: baseline (original IRRA) or extended (with optional noise-masking at test)",
+    )
+
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
     parser.add_argument("--stride_size", type=int, default=16)
