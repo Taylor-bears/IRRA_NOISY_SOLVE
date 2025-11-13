@@ -259,7 +259,9 @@ class ImageTextNoiseDetectionDataset(Dataset):
                  text_length: int = 77,
                  truncate: bool = True,
                  mlm_enable: bool = True,
-                 attribute_vocab_path: str = 'utils/attribute_vocab.txt'):
+                 attribute_vocab_path: str = 'utils/attribute_vocab.txt',
+                 attribute_vocab_write_epochs: int = 2,
+                 attribute_vocab_write_enable: bool = True):
         super().__init__()
         self.transform = transform
         self.text_length = text_length
@@ -267,13 +269,26 @@ class ImageTextNoiseDetectionDataset(Dataset):
         self.tokenizer = SimpleTokenizer()
         # 可选的MLM设置（若启用，则基于clean文本构造MLM样本）
         self.mlm_enable = mlm_enable
-        # 动态属性词写入：把差异词（clean/noisy）追加写入到该文件，持续扩充词汇库
+        # 动态属性词写入：把差异词（clean/noisy）追加写入到该文件，持续扩充词汇库（受全局写时钟控制）
         self.attribute_vocab_path = attribute_vocab_path
-        self._written_cache = set()  # 本worker内简单去重，避免重复写爆
+        self._written_cache = set()  # 本worker内去重缓存
+        self._write_epoch_limit = int(attribute_vocab_write_epochs) if attribute_vocab_write_enable else 0
+        self._clock_path = self.attribute_vocab_path + '.clock'
+        # 确保目录存在 + 读取已有文件到缓存，并进行一次性去重重写，降低重复
         try:
             dirpath = osp.dirname(self.attribute_vocab_path)
             if dirpath and (not osp.exists(dirpath)):
                 os.makedirs(dirpath, exist_ok=True)
+            if osp.exists(self.attribute_vocab_path):
+                with open(self.attribute_vocab_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        w = line.strip().lower()
+                        if w:
+                            self._written_cache.add(w)
+                # 将已有内容去重后重写一次（避免历史重复）
+                with open(self.attribute_vocab_path, 'w', encoding='utf-8') as f:
+                    for w in sorted(self._written_cache):
+                        f.write(w + "\n")
         except Exception:
             pass
         # 简易停用词，用于内容词启发式
@@ -288,10 +303,12 @@ class ImageTextNoiseDetectionDataset(Dataset):
         # 只保留训练split，且要求同时包含 captions 与 captions_rw
         train_annos = [a for a in annos if a.get('split') == 'train' and 'captions' in a and 'captions_rw' in a]
 
+        pid_container = set()
         self.samples = [] # 存储所有样本的列表
         image_id = 0
         for anno in train_annos:
             pid = int(anno['id']) - 1  # 训练pid从0开始
+            pid_container.add(pid)
             img_path = osp.join(img_dir, anno['file_path'])
             clean_caps = anno['captions']
             noisy_caps = anno['captions_rw']
@@ -300,6 +317,8 @@ class ImageTextNoiseDetectionDataset(Dataset):
             for i in range(m):
                 self.samples.append((pid, image_id, img_path, clean_caps[i], noisy_caps[i]))
             image_id += 1
+        for idx,pid in enumerate(sorted(pid_container)):
+            assert idx == pid, f"idx: {idx} and pid: {pid} are not match"
 
     def __len__(self):
         return len(self.samples)
@@ -410,9 +429,9 @@ class ImageTextNoiseDetectionDataset(Dataset):
             ret['mlm_ids'] = mlm_ids
             ret['mlm_labels'] = mlm_labels
 
-        # 将当前样本中的差异词写入 attribute_vocab_path（逐步扩充词汇库）
+        # 将当前样本中的差异词写入 attribute_vocab_path（逐步扩充词汇库，仅在前N轮允许写入）
         try:
-            if hasattr(self, 'attribute_vocab_path') and self.attribute_vocab_path:
+            if self._can_write_attribute_vocab():
                 self._append_attribute_vocab_from_spans(replaced_spans)
         except Exception:
             pass
@@ -476,3 +495,21 @@ class ImageTextNoiseDetectionDataset(Dataset):
         if lines:
             with open(self.attribute_vocab_path, 'a', encoding='utf-8') as f:
                 f.writelines(lines)
+
+    def _can_write_attribute_vocab(self) -> bool:
+        """
+        基于全局写时钟控制是否写入：
+        - 写时钟文件位于 attribute_vocab.txt 同路径，扩展名 .clock；由训练循环在每个epoch开始时写入当前epoch编号（从1开始）。
+        - 仅当 时钟值 <= self._write_epoch_limit 时允许写入；否则不写。
+        """
+        if self._write_epoch_limit <= 0:
+            return False
+        try:
+            if not osp.exists(self._clock_path):
+                return False
+            with open(self._clock_path, 'r', encoding='utf-8') as f:
+                val = f.read().strip()
+            epoch_idx = int(val) if val else 0
+            return epoch_idx <= self._write_epoch_limit
+        except Exception:
+            return False

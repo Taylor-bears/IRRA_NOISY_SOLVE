@@ -6,6 +6,7 @@ from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
 from torch.utils.tensorboard import SummaryWriter
 from prettytable import PrettyTable
+import os
 
 # 模型训练循环，包含前向传播、损失计算、反向传播、日志记录和周期性验证。
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
@@ -48,6 +49,14 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         for meter in meters.values():
             meter.reset()
         model.train()
+
+        # 全局写时钟：每个epoch开始时更新，供数据集控制“前N轮”动态词库写入
+        try:
+            clock_path = getattr(args, 'attribute_vocab_path', 'utils/attribute_vocab.txt') + '.clock'
+            with open(clock_path, 'w', encoding='utf-8') as f:
+                f.write(str(epoch))
+        except Exception:
+            pass
 
         # 遍历训练数据
         for n_iter, batch in enumerate(train_loader): # n_iter是当前epoch中的迭代次数
