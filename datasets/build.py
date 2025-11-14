@@ -111,7 +111,10 @@ def build_dataloader(args, tranforms=None):
     logger = logging.getLogger("IRRA.dataset")
 
     num_workers = args.num_workers
-    dataset = __factory[args.dataset_name](root=args.root_dir)
+    if args.dataset_name == "CUHK-PEDES":
+        dataset = __factory[args.dataset_name](root=args.root_dir, reid_raw= args.reid_raw)
+    else:
+        dataset = __factory[args.dataset_name](root=args.root_dir)
     num_classes = len(dataset.train_id_container)
     
     if args.training: # 训练模式

@@ -12,6 +12,7 @@ def get_args():
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
+    parser.add_argument("--reid_raw", default="reid_raw.json", help='the reid raw json file path')
 
     ######################## model general settings ########################
     parser.add_argument("--pretrain_choice", default='ViT-B/16') # whether use pretrained model
@@ -120,6 +121,13 @@ def get_args():
         type=int,
         default=0,
         help="epoch index (1-based) to start applying consistency loss; before this epoch consistency loss weight=0，一致性损失开始参与的epoch编号(从1开始)"
+    )
+    # 测试期噪声掩码启用的最早epoch（若>0则在该epoch之前不做mask，即使传了--mask_noise_at_test）
+    parser.add_argument(
+        "--mask_test_start_epoch",
+        type=int,
+        default=0,
+        help="epoch index (1-based) after which test-time noise masking is enabled; 0=immediate if --mask_noise_at_test is set",
     )
 
     # 评估器实现选择：baseline(与原IRRA一致) 或 extended(支持测试期噪声掩码)

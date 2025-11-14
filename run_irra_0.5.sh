@@ -11,7 +11,7 @@ CUDA_VISIBLE_DEVICES=3 \
 --loss_names 'sdm+mlm+id' \
 --val_dataset test \
 --num_epoch 60 \
---reid_raw 'reid_raw.json' \
+--reid_raw 'reid_raw_0.5.json' \
 --noise_detection \
 --noisy_train_json './data/CUHK-PEDES/bear_noisy_data/reid_rw_with_train_noisy_33821_20638_10297_3370/train_reid_rw_all.json' \
 --noise_loss_weight 0.2 \
@@ -21,7 +21,6 @@ CUDA_VISIBLE_DEVICES=3 \
 --consistency_loss_weight 0.05 \
 --consistency_start_epoch 8 \
 --consistency_warmup_epochs 8 \
---mask_test_start_epoch 16 \
 --eval_impl extended \
 --mask_noise_at_test \
 --mask_strategy soft \

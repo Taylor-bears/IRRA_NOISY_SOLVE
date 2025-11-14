@@ -12,4 +12,3 @@ CUDA_VISIBLE_DEVICES=3 \
 --num_epoch 60 \
 --use_clean_for_retrieval \
 --eval_impl baseline
-# --loss_names 'sdm+mlm+id' 暂时先关了mlm

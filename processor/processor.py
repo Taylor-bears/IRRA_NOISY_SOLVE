@@ -155,6 +155,19 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         if epoch % eval_period == 0:
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))
+                # 基于 --mask_test_start_epoch 进行测试期噪声掩码的延迟启用
+                mask_noise_flag = getattr(args, 'mask_noise_at_test', False)
+                start_ep_gate = getattr(args, 'mask_test_start_epoch', 0)
+                if mask_noise_flag:
+                    if start_ep_gate > 0 and epoch < start_ep_gate:
+                        evaluator.mask_noise = False
+                        logger.info(f"[Eval Gate] epoch {epoch} < mask_test_start_epoch {start_ep_gate}: disable masking this eval")
+                    else:
+                        evaluator.mask_noise = True
+                        logger.info(f"[Eval Gate] masking enabled at epoch {epoch} (start_gate={start_ep_gate})")
+                else:
+                    evaluator.mask_noise = False
+                    logger.info(f"[Eval Gate] mask_noise_at_test flag False: masking disabled")
                 # 切换模型为评估模式并计算指标
                 if args.distributed:
                     top1 = evaluator.eval(model.module.eval())

@@ -36,12 +36,12 @@ class CUHKPEDES(BaseDataset):
     """
     dataset_dir = 'CUHK-PEDES'
 
-    def __init__(self, root='', verbose=True):
+    def __init__(self, root="", reid_raw= 'reid_raw.json', verbose=True):
         super(CUHKPEDES, self).__init__()
         self.dataset_dir = op.join(root, self.dataset_dir)
         self.img_dir = op.join(self.dataset_dir, 'imgs/')
 
-        self.anno_path = op.join(self.dataset_dir, 'reid_raw.json')
+        self.anno_path = op.join(self.dataset_dir, reid_raw)
         self._check_before_run()
 
         self.train_annos, self.test_annos, self.val_annos = self._split_anno(self.anno_path)
