@@ -179,7 +179,7 @@ def do_inference(model, test_img_loader, test_txt_loader):
     logger.info("Enter inferencing")
     # 初始化评估器（计算Top-1、mAP等指标）
     # 按需启用测试时噪声掩码（从模型参数中读取）
-    mask_noise = getattr(getattr(model, 'args', object()), 'mask_noise_at_test', False)
+    mask_noise = getattr(getattr(model, 'args', object()), 'mask_noise_at_test', True)
     # 根据实现选择评估器
     try:
         from utils.options import get_args as _get_args_for_eval

@@ -52,13 +52,13 @@ def get_args():
     parser.add_argument(
         "--mask_prob_thresh",
         type=float,
-        default=0.5,
+        default=0.55,
         help="probability threshold for masking a token as noise，判断为噪声的概率阈值",
     )
     parser.add_argument(
         "--mask_max_ratio",
         type=float,
-        default=0.3,
+        default=0.30,
         help="max ratio of valid tokens to mask to avoid over-masking，比例噪声数量限制",
     )
     parser.add_argument(

@@ -176,13 +176,11 @@ class Evaluator:
                         else:
                             # 默认 topk_mean：先对Top-K图像序列取均值，再一次融合预测
                             # K个图像 → 平均 → 1次融合 → 1次预测
-                            # 创建空的伪图像特征张量
-                            pseudo_img = torch.empty((Bq, L_img, D), device=device, dtype=image_seq_feats_cat.dtype)
-                            for b in range(Bq):
-                                # 从图库中获取与当前文本最相似的K个图像的序列特征
-                                seqs = image_seq_feats_cat[topk_idx[b]]  # (k, L_img, D)
-                                # 对K个图像的序列特征求平均，得到伪图像上下文
-                                pseudo_img[b] = seqs.mean(0)
+                            # 利用 gather 直接一次性取出所有候选序列再求平均，减少 Python 循环
+                            # 索引操作：对每个索引值，从image_seq_feats_cat中提取对应的图像序列，topk_idx[0] = [23, 45, 67, 89, 12]，那么gathered[0] 包含image_seq_feats_cat[23]······[12]
+                            gathered = image_seq_feats_cat[topk_idx]  # (B, k, L_img, D)
+                            # 在第k维度上求均值，得到每一个caption的伪图像上下文
+                            pseudo_img = gathered.mean(1)  # (B, L_img, D)
                             fused = model.cross_former(seq_text_feats, pseudo_img, pseudo_img)  # (B, L_t, D)
                             noise_logits = model.noise_detection_head(fused)
                             prob = torch.softmax(noise_logits, dim=-1)[..., 1]  # (B, L_t)

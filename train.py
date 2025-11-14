@@ -72,11 +72,12 @@ if __name__ == '__main__':
     is_master = get_rank() == 0
     checkpointer = Checkpointer(model, optimizer, scheduler, args.output_dir, is_master) # 管理
     # 选择评估器实现：baseline(原IRRA) 或 extended(支持测试期噪声掩码)
+    mask_noise = getattr(getattr(model, 'args', object()), 'mask_noise_at_test', True)
     if getattr(args, 'eval_impl', 'extended') == 'baseline':
         from utils.metrics_baseline import Evaluator as EvaluatorBaseline
         evaluator = EvaluatorBaseline(val_img_loader, val_txt_loader)
     else:
-        evaluator = EvaluatorExtended(val_img_loader, val_txt_loader)
+        evaluator = EvaluatorExtended(val_img_loader, val_txt_loader, mask_noise)
 
     start_epoch = 1
     if args.resume:
