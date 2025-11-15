@@ -11,6 +11,7 @@ import random
 import regex as re
 import copy
 from utils.iotools import read_json
+from utils.attribute_extractor import build_attribute_mask
 import difflib
 
 class BaseDataset(object):
@@ -291,14 +292,7 @@ class ImageTextNoiseDetectionDataset(Dataset):
                         f.write(w + "\n")
         except Exception:
             pass
-        # 简易停用词，用于内容词启发式
-        self.stopwords = {
-            'a','an','the','and','or','but','if','while','for','to','of','in','on','at','by','with','from','as','is','are','was','were','be','been','being',
-            'he','she','it','they','them','his','her','their','this','that','these','those','there','here','over','under','up','down','across','into','out','about',
-            'i','you','we','me','us','my','your','our','yours','ours','him','hers','its','who','whom','which','what','when','where','why','how',
-            'very','more','most','so','such','too','just','only','also','not','no','than','then','before','after','again','once'
-        }
-
+        # 属性词由NLTK + 词典规则提取
         annos = read_json(noisy_json_path)
         # 只保留训练split，且要求同时包含 captions 与 captions_rw
         train_annos = [a for a in annos if a.get('split') == 'train' and 'captions' in a and 'captions_rw' in a]
@@ -347,7 +341,7 @@ class ImageTextNoiseDetectionDataset(Dataset):
             replaced_spans = []  # 收集replace片段（clean/noisy）以便写入词表
             for tag, i1, i2, j1, j2 in matcher.get_opcodes():
                 # tag in ('replace','delete','insert','equal')
-                if tag == 'replace': # 我们当前的模式只用到replace
+                if tag == 'replace' or tag == 'insert': # 我们当前的模式只用到replace，但是不排除可能加了一些词
                     # noisy words in [j1, j2) are considered modified/noisy
                     for j in range(j1, j2):
                         noise_word_flags[j] = 1 
@@ -392,20 +386,10 @@ class ImageTextNoiseDetectionDataset(Dataset):
                     if t_start < t_end:
                         noise_labels[t_start:t_end] = 1
 
-            # 5) 生成 attribute_mask，现在的mask不仅仅包含差异处，还包含了正样本重要内容处，用于后面算损失时可以动态调整放大噪声损失，因为自身值过于小了
-            # attribute_mask：属性/内容词位置置1，并并入所有正样本（更广覆盖的监督）
-            attribute_mask = torch.zeros(self.text_length, dtype=torch.float)
-            for wi, w in enumerate(noisy_words):
-                base = re.sub(r"[^A-Za-z]+", "", w).lower()
-                # 不再依赖外部属性词库，采用启发式内容词（避免漏检）
-                is_content = base.isalpha() and (len(base) >= 2) and (base not in self.stopwords)
-                if is_content and wi < len(word_to_token_span) and base:
-                    start, end = word_to_token_span[wi]
-                    t_start = min(1 + start, self.text_length)
-                    t_end = min(1 + end, self.text_length)
-                    if t_start < t_end:
-                        attribute_mask[t_start:t_end] = 1.0
-            # 并入正样本位置
+            # 5) 使用 NLTK+词典规则生成 attribute_mask：仅属性词位置置1（不再扩大到所有“内容词”）
+            raw_mask_list = build_attribute_mask(noisy_words, word_to_token_span, self.text_length, offset=1)
+            attribute_mask = torch.tensor(raw_mask_list, dtype=torch.float)
+            # 噪声位置强制置1（防止漏掉被替换的属性词）：
             attribute_mask = torch.where(noise_labels > 0, torch.ones_like(attribute_mask), attribute_mask)
 
             noisy_tokens = tokens_tensor

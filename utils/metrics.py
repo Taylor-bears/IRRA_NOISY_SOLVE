@@ -4,6 +4,7 @@ import numpy as np
 import os
 import torch.nn.functional as F
 import logging
+from utils.simple_tokenizer import SimpleTokenizer
 
 
 def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
@@ -98,39 +99,61 @@ class Evaluator:
         mask_token_id = None
         eot_token_id = None
         if self.mask_noise:
-            from utils.simple_tokenizer import SimpleTokenizer
-
             tokenizer = SimpleTokenizer()
             mask_token_id = tokenizer.encoder.get("<|mask|>")
             eot_token_id = tokenizer.encoder.get("<|endoftext|>")
             # 属性词过滤：仅当开启时才生效
             args_obj = getattr(model, 'args', object())
             enable_attr_filter = getattr(args_obj, 'enable_attribute_filter', False)
-            attr_set = set()
+            # 若开启属性过滤，使用 attribute_extractor 的 build_attribute_mask 生成 token 级允许掩码
             if enable_attr_filter:
-                vocab_path = getattr(args_obj, 'attribute_vocab_path', 'utils/attribute_vocab.txt')
-                try:
-                    with open(vocab_path, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            w = line.strip().lower()
-                            if w:
-                                attr_set.add(w)
-                    self.logger.info(f"[Eval] Attribute filter enabled; loaded {len(attr_set)} words from {vocab_path}")
-                except Exception as e:
-                    self.logger.warning(f"[Eval] Attribute vocab not loaded from {vocab_path}: {e}; disabling filter")
-                    enable_attr_filter = False
+                from utils.attribute_extractor import build_attribute_mask
 
-            def _allowed_token(token_id: int) -> bool:
-                if not enable_attr_filter:
-                    return True
-                # 根据token_id从tokenizer的解码器中查找对应的文本内容
-                tok = tokenizer.decoder.get(int(token_id), '')
-                # 去除token中的词尾标记'</w>'
-                base = tok.replace('</w>', '')
-                # 遍历每个字符，只保留字母字符
-                base = ''.join([c for c in base if c.isalpha()]).lower()
-                # 仅允许长度>=3的字母词，且在属性词表
-                return (len(base) >= 3) and (base in attr_set)
+                def _compute_allowed_mask_for_row(row_tokens: torch.Tensor) -> torch.Tensor:
+                    """基于 BPE token 重建词与span，调用 attribute_extractor.build_attribute_mask 获取允许掩码。
+                    返回长度为L的bool张量，True表示该token位置可作为属性词进行掩码候选。
+                    """
+                    # 确定有效范围（去掉起始特殊符号，截止到第一个eot之前）
+                    L = int(row_tokens.size(0))
+                    end_pos = L - 1
+                    if eot_token_id is not None:
+                        eot_positions = (row_tokens == eot_token_id).nonzero(as_tuple=False)
+                        if eot_positions.numel() > 0:
+                            end_pos = int(eot_positions[0].item())
+                    start = 1
+                    if end_pos <= start:
+                        return torch.zeros(L, dtype=torch.bool, device=row_tokens.device)
+                    # 重建词序列与对应token span（相对去掉起始特殊符号后的索引）
+                    words: list[str] = [] # 存储重建的完整单词
+                    spans: list[tuple[int,int]] = [] # 存储每个单词对应的token位置范围
+                    cur_chars: list[str] = [] # 当前正在构建的单词字符列表
+                    cur_start: int | None = None # 当前单词的起始token索引
+                    for rel_idx, t in enumerate(row_tokens[start:end_pos].tolist()):
+                        piece = tokenizer.decoder.get(int(t), '')
+                        # 如果是新单词的开始，记录起始位置
+                        if cur_start is None:
+                            cur_start = rel_idx
+                        # 去除BPE结尾标记
+                        seg = piece.replace('</w>', '')
+                        cur_chars.append(seg)
+                        # 通过BPE词尾标记判断是否是单词结尾，因为一个单词可能被拆成多个BPE片段
+                        end_of_word = piece.endswith('</w>')
+                        if end_of_word: # 遇到结尾
+                            # 将字符列表拼接成完整单词
+                            w = ''.join(cur_chars)
+                            words.append(w)
+                            spans.append((cur_start, rel_idx + 1))  # 记录该单词对应的token范围
+                             # 重置当前单词状态，准备构建下一个单词
+                            cur_chars = []
+                            cur_start = None
+                    # 收尾：若最后一个词无</w>也收集
+                    if cur_chars and cur_start is not None:
+                        w = ''.join(cur_chars)
+                        words.append(w)
+                        spans.append((cur_start, (row_tokens[start:end_pos].size(0))))
+                    # 调用属性提取器生成token级掩码，offset=1 用于对齐起始特殊符号的偏移
+                    mask_list = build_attribute_mask(words, spans, text_length=L, offset=1)
+                    return torch.tensor(mask_list, dtype=torch.bool, device=row_tokens.device)
 
         # ===== 文本特征提取阶段 =====
         for pid, caption in self.txt_loader:
@@ -207,15 +230,16 @@ class Evaluator:
                             valid_range = (1, max(1, end_pos)) # [0]为开头，[1]为结束
                             if valid_range[1] <= valid_range[0]:
                                 continue
+                            # 预先计算整句允许掩码（属性词/短语）
+                            allowed_mask_full = None
+                            if enable_attr_filter:
+                                allowed_mask_full = _compute_allowed_mask_for_row(masked_caption[b])
                             cand_idx = torch.arange(valid_range[0], valid_range[1], device=device)
                             # 获取有效位置的噪声概率
                             cand_prob = prob[b, cand_idx]
                             # 属性词过滤
-                            if enable_attr_filter:
-                                allow_mask = []
-                                for t_id in caption[b, cand_idx].tolist():
-                                    allow_mask.append(_allowed_token(int(t_id)))
-                                allow_mask = torch.tensor(allow_mask, device=device, dtype=torch.bool)
+                            if enable_attr_filter and allowed_mask_full is not None:
+                                allow_mask = allowed_mask_full[cand_idx]
                                 cand_idx = cand_idx[allow_mask]
                                 cand_prob = cand_prob[allow_mask]
                             # 筛选出超过噪声阈值的token
@@ -251,14 +275,15 @@ class Evaluator:
                             valid_range = (1, max(1, end_pos))
                             if valid_range[1] <= valid_range[0]:
                                 continue
+                            # 预先计算整句允许掩码（属性词/短语）
+                            allowed_mask_full = None
+                            if enable_attr_filter:
+                                allowed_mask_full = _compute_allowed_mask_for_row(caption[b])
                             cand_idx = torch.arange(valid_range[0], valid_range[1], device=device)
                             cand_prob = prob[b, cand_idx]
                             # 属性词过滤
-                            if enable_attr_filter:
-                                allow_mask = []
-                                for t_id in caption[b, cand_idx].tolist():
-                                    allow_mask.append(_allowed_token(int(t_id)))
-                                allow_mask = torch.tensor(allow_mask, device=device, dtype=torch.bool)
+                            if enable_attr_filter and allowed_mask_full is not None:
+                                allow_mask = allowed_mask_full[cand_idx]
                                 cand_idx = cand_idx[allow_mask]
                                 cand_prob = cand_prob[allow_mask]
                             mask_sel = cand_prob > prob_thresh

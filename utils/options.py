@@ -91,6 +91,7 @@ def get_args():
     parser.add_argument(
         "--enable_attribute_filter",
         action='store_true',
+        default=False,
         help="enable attribute vocabulary filtering when masking (only tokens whose decoded piece matches an attribute word can be masked)，表示是否启用属性词汇过滤",
     )
     parser.add_argument(
@@ -109,6 +110,12 @@ def get_args():
         type=int,
         default=0,
         help="epoch index (1-based) at which to start applying noise loss warmup; before this epoch noise loss weight=0，噪声损失开始参与的epoch编号(从1开始)"
+    )
+    parser.add_argument(
+        "--dynamic_noise_class_weight",
+        action='store_true',
+        default=False,
+        help="Enable dynamic class weighting for noise loss (pos weight = #neg/#pos). Keep off by default since attribute filtering already focuses tokens，支持动态计算noisy_loss时正负样本的类别权重调整（默认关闭）",
     )
     parser.add_argument(
         "--consistency_warmup_epochs",
