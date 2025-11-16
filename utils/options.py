@@ -106,6 +106,11 @@ def get_args():
         help="use clean caption (if available) for retrieval/id losses while keeping noisy caption for noise detection & consistency，是否在检索/ID损失使用干净文本"
     )
     parser.add_argument(
+        "--disable_consistency_loss",
+        action='store_true',
+        help="hard switch to disable consistency loss computation entirely; when set, forward will not compute consistency branch at all，交流中认为consistency loss的设定有争议，提供硬开关以便关闭",
+    )
+    parser.add_argument(
         "--noise_start_epoch",
         type=int,
         default=0,
@@ -144,6 +149,14 @@ def get_args():
         choices=["baseline", "extended"],
         default="extended",
         help="which evaluator implementation to use: baseline (original IRRA) or extended (with optional noise-masking at test)",
+    )
+
+    # 测试集（带噪版本）JSON：用于在评估时提供 captions/clean_captions 两种文本
+    parser.add_argument(
+        "--test_noisy_json",
+        type=str,
+        default="./data/CUHK-PEDES/bear_noisy_data/reid_rw_with_test_noisy_3007_1906_944_299/test_reid_rw_all.json",
+        help="path to noisy test json that includes both captions and captions_rw for evaluation",
     )
 
     ######################## vison trainsformer settings ########################

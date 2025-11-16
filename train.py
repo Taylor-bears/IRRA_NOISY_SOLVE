@@ -49,7 +49,7 @@ if __name__ == '__main__':
     save_train_configs(args.output_dir, args)
 
     # get image-text pair datasets dataloader
-    # 分别是训练集数据加载器，验证集图像数据加载器，验证集文本数据加载器，类别数（构建输出）
+    # 分别是训练集数据加载器，验证集图像数据加载器，验证集文本数据加载器(可能是dict)，类别数（构建输出）
     train_loader, val_img_loader, val_txt_loader, num_classes = build_dataloader(args)
     # 构建模型，得到的model用于后续训练和验证
     model = build_model(args, num_classes)

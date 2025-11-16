@@ -112,7 +112,7 @@ def build_dataloader(args, tranforms=None):
 
     num_workers = args.num_workers
     if args.dataset_name == "CUHK-PEDES":
-        dataset = __factory[args.dataset_name](root=args.root_dir, reid_raw= args.reid_raw)
+        dataset = __factory[args.dataset_name](root=args.root_dir, reid_raw=args.reid_raw, test_noisy_json=getattr(args, 'test_noisy_json', None))
     else:
         dataset = __factory[args.dataset_name](root=args.root_dir)
     num_classes = len(dataset.train_id_container)
@@ -189,23 +189,21 @@ def build_dataloader(args, tranforms=None):
 
         # 构建验证集（使用测试集或专用验证集）
         ds = dataset.val if args.val_dataset == 'val' else dataset.test
-        # 验证集图像和文本数据集
-        val_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
-                                   val_transforms)
-        val_txt_set = TextDataset(ds['caption_pids'],
-                                  ds['captions'],
-                                  text_length=args.text_length)
-        # 验证集数据加载器
-        val_img_loader = DataLoader(val_img_set,
-                                    batch_size=args.batch_size,
-                                    shuffle=False,
-                                    num_workers=num_workers)
-        val_txt_loader = DataLoader(val_txt_set,
-                                    batch_size=args.batch_size,
-                                    shuffle=False,
-                                    num_workers=num_workers)
+        # 验证集图像数据集
+        val_img_set = ImageDataset(ds['image_pids'], ds['img_paths'], val_transforms)
+        val_img_loader = DataLoader(val_img_set, batch_size=args.batch_size, shuffle=False, num_workers=num_workers)
+        # 文本：如果提供了 clean_captions，则构建多路文本loader（mask由评估时在线生成，不再从数据集中读取）
+        txt_loaders = {}
+        # noisy ，注意TextDataset输入captions返回的是token序列列表
+        val_txt_noisy = TextDataset(ds['caption_pids'], ds['captions'], text_length=args.text_length)
+        txt_loaders['noisy'] = DataLoader(val_txt_noisy, batch_size=args.batch_size, shuffle=False, num_workers=num_workers)
+        # clean（若存在）
+        if 'clean_captions' in ds:
+            val_txt_clean = TextDataset(ds['caption_pids'], ds['clean_captions'], text_length=args.text_length)
+            txt_loaders['clean'] = DataLoader(val_txt_clean, batch_size=args.batch_size, shuffle=False, num_workers=num_workers)
+        # 不再构建 mask 文本loader，避免无用数据通道
 
-        return train_loader, val_img_loader, val_txt_loader, num_classes
+        return train_loader, val_img_loader, txt_loaders, num_classes
 
     else: # 测试模式
         # 构建测试变换
@@ -216,19 +214,13 @@ def build_dataloader(args, tranforms=None):
                                                is_train=False)
 
         ds = dataset.test
-        # 测试集图像和文本数据集
-        test_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
-                                    test_transforms)
-        test_txt_set = TextDataset(ds['caption_pids'],
-                                   ds['captions'],
-                                   text_length=args.text_length)
-        # 测试集数据加载器
-        test_img_loader = DataLoader(test_img_set,
-                                     batch_size=args.test_batch_size,
-                                     shuffle=False,
-                                     num_workers=num_workers)
-        test_txt_loader = DataLoader(test_txt_set,
-                                     batch_size=args.test_batch_size,
-                                     shuffle=False,
-                                     num_workers=num_workers)
-        return test_img_loader, test_txt_loader, num_classes
+        test_img_set = ImageDataset(ds['image_pids'], ds['img_paths'], test_transforms)
+        test_img_loader = DataLoader(test_img_set, batch_size=args.test_batch_size, shuffle=False, num_workers=num_workers)
+        test_txt_loaders = {}
+        test_txt_noisy = TextDataset(ds['caption_pids'], ds['captions'], text_length=args.text_length)
+        test_txt_loaders['noisy'] = DataLoader(test_txt_noisy, batch_size=args.test_batch_size, shuffle=False, num_workers=num_workers)
+        if 'clean_captions' in ds:
+            test_txt_clean = TextDataset(ds['caption_pids'], ds['clean_captions'], text_length=args.text_length)
+            test_txt_loaders['clean'] = DataLoader(test_txt_clean, batch_size=args.test_batch_size, shuffle=False, num_workers=num_workers)
+        # 测试同样不构建 mask 文本loader
+        return test_img_loader, test_txt_loaders, num_classes

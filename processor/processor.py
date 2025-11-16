@@ -33,11 +33,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         "consistency_loss": AverageMeter(),
         "img_acc": AverageMeter(),
         "txt_acc": AverageMeter(),
-        "mlm_acc": AverageMeter()
+        "mlm_acc": AverageMeter(),
+        "noise_acc": AverageMeter()
     }
-    # 单独记录噪声检测准确率（不按batch_size加权，以掩码内样本平均即可）
-    # AverageMeter是一个工具类，用于计算移动平均，累积多个值并计算平均值，常用于训练过程中监控指标
-    noise_acc_meter = AverageMeter()
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
@@ -115,9 +113,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             meters['img_acc'].update(ret.get('img_acc', 0), batch_size)
             meters['txt_acc'].update(ret.get('txt_acc', 0), batch_size)
             meters['mlm_acc'].update(ret.get('mlm_acc', 0), 1)
-            if 'noise_acc' in ret:
-                # 采用简单累积平均
-                noise_acc_meter.update(ret['noise_acc'], 1)
+            meters['noise_acc'].update(ret.get('noise_acc', 0), 1)
             # 反向传播优化
             optimizer.zero_grad()
             total_loss.backward()
@@ -138,8 +134,6 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         for k, v in meters.items():
             if v.avg > 0:
                 tb_writer.add_scalar(k, v.avg, epoch)
-        if noise_acc_meter.avg > 0:
-            tb_writer.add_scalar('noise_acc', noise_acc_meter.avg, epoch)
 
         # 更新学习率
         scheduler.step()

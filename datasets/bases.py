@@ -243,7 +243,7 @@ class ImageTextMLMDataset(Dataset):
         return torch.tensor(tokens), torch.tensor(labels)
 
 
-# new
+# new for train
 class ImageTextNoiseDetectionDataset(Dataset):
     """
     用于噪声词检测任务的图文数据集。

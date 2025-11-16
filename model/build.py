@@ -236,7 +236,8 @@ class IRRA(nn.Module):
         # 一致性损失：clean vs noisy 文本（同一图像）句向量应接近
         # 它的作用在于让同一张图的 clean 文本与 noisy 文本的句向量尽量一致，降低模型对“属性替换”噪声的敏感度。
         cons_w = getattr(self.args, 'consistency_loss_weight', 0.0)
-        if cons_w > 0.0 and ('clean_caption_ids' in batch):
+        disable_cons = getattr(self.args, 'disable_consistency_loss', False)
+        if (not disable_cons) and cons_w > 0.0 and ('clean_caption_ids' in batch):
             clean_ids = batch['clean_caption_ids']
             clean_feats_seq = self.base_model.encode_text(clean_ids)  # (B, L, D)
             # 提取每个样本或者每个cap对应[EOS]位置的向量

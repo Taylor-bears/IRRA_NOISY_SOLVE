@@ -36,7 +36,7 @@ class CUHKPEDES(BaseDataset):
     """
     dataset_dir = 'CUHK-PEDES'
 
-    def __init__(self, root="", reid_raw= 'reid_raw.json', verbose=True):
+    def __init__(self, root="", reid_raw= 'reid_raw.json', test_noisy_json: str | None = None, verbose=True):
         super(CUHKPEDES, self).__init__()
         self.dataset_dir = op.join(root, self.dataset_dir)
         self.img_dir = op.join(self.dataset_dir, 'imgs/')
@@ -45,9 +45,21 @@ class CUHKPEDES(BaseDataset):
         self._check_before_run()
 
         self.train_annos, self.test_annos, self.val_annos = self._split_anno(self.anno_path)
+        # 若提供了带噪声标注的测试集JSON，则读取对照测试集（顺序与数量与 reid_raw 保持一致）
+        if test_noisy_json:
+            try:
+                #  self.test_annos 沿用reid_raw里的分割得到，因为那个里面的test是含有20%/50%/80%比例噪声的文本，而不是全部都是噪声的文本
+                noisy_annos = read_json(test_noisy_json) # compare_annos 包含每对干净与噪声文本
+                self.test_compare_annos = [a for a in noisy_annos if a.get('split', 'test') == 'test']
+                self.logger.info(f"Loaded compare test json: {test_noisy_json} with {len(self.test_compare_annos)} entries")
+            except Exception as e:
+                self.logger.warning(f"Failed to read test noisy json '{test_noisy_json}': {e}. Fallback to default test from reid_raw.json")
 
         self.train, self.train_id_container = self._process_anno(self.train_annos, training=True)
-        self.test, self.test_id_container = self._process_anno(self.test_annos)
+        if test_noisy_json:
+            self.test, self.test_id_container = self._process_anno(self.test_annos, test_compare_annos=self.test_compare_annos)
+        else:
+            self.test, self.test_id_container = self._process_anno(self.test_annos)
         self.val, self.val_id_container = self._process_anno(self.val_annos)
 
         if verbose:
@@ -67,9 +79,10 @@ class CUHKPEDES(BaseDataset):
                 val_annos.append(anno)
         return train_annos, test_annos, val_annos
 
-  
-    def _process_anno(self, annos: List[dict], training=False):
+
+    def _process_anno(self, annos: List[dict], training=False, test_compare_annos: List[dict] | None = None):
         pid_container = set()
+        assert len(test_compare_annos) == len(self.test_annos)
         if training:
             dataset = []
             image_id = 0
@@ -81,31 +94,47 @@ class CUHKPEDES(BaseDataset):
                 for caption in captions:
                     dataset.append((pid, image_id, img_path, caption))
                 image_id += 1
-            for idx, pid in enumerate(pid_container):
-                # check pid begin from 0 and no break
+            for idx, pid in enumerate(sorted(pid_container)):
+                # check pid begin from 0 and no break（排序后校验，避免set遍历无序）
                 assert idx == pid, f"idx: {idx} and pid: {pid} are not match"
             return dataset, pid_container
         else:
             dataset = {}
             img_paths = []
-            captions = []
             image_pids = []
+            # 两种文本集合：noisy（默认用于 captions）、clean（clean_captions）
+            noisy_captions = []
+            clean_captions = []
             caption_pids = []
-            for anno in annos:
+            for index, anno in enumerate(annos):
+                assert test_compare_annos[index]['file_path'] == self.test_annos[index]['file_path']
+                assert len(self.test_annos[index]['captions']) == len(test_compare_annos[index]['captions'])
                 pid = int(anno['id'])
                 pid_container.add(pid)
                 img_path = op.join(self.img_dir, anno['file_path'])
                 img_paths.append(img_path)
                 image_pids.append(pid)
-                caption_list = anno['captions'] # caption list
-                for caption in caption_list:
-                    captions.append(caption)
+                # 兼容两种格式：仅 captions（原始），或 captions + captions_rw（带噪）
+                cap_list_noisy = anno.get('captions', None)
+                if test_compare_annos is not None:
+                    cap_list_clean = test_compare_annos[index].get('captions', []) or []
+                else:
+                    cap_list_clean = []
+                if cap_list_noisy is None:
+                    cap_list_noisy = cap_list_clean
+                for c in cap_list_noisy:
+                    noisy_captions.append(c)
                     caption_pids.append(pid)
+                for c in cap_list_clean:
+                    clean_captions.append(c)
             dataset = {
                 "image_pids": image_pids,
                 "img_paths": img_paths,
                 "caption_pids": caption_pids,
-                "captions": captions
+                # noisy 版本作为默认 captions
+                "captions": noisy_captions,
+                # clean 版本
+                "clean_captions": clean_captions if clean_captions else noisy_captions,
             }
             return dataset, pid_container
 
