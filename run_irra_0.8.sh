@@ -1,4 +1,5 @@
 #!/bin/bash
+$env:NLTK_DATA = "$PWD\nltk_data"
 DATASET_NAME="CUHK-PEDES"
 
 CUDA_VISIBLE_DEVICES=3 \

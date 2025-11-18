@@ -1,12 +1,33 @@
 import re
 from typing import List, Tuple
 import nltk
+import os
+
+# 优先从项目本地 nltk_data 目录加载，避免训练时联网下载
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+_NLTK_LOCAL_DIR = os.getenv('NLTK_DATA', os.path.join(_PROJECT_ROOT, 'nltk_data'))
+if _NLTK_LOCAL_DIR not in nltk.data.path:
+    nltk.data.path.insert(0, _NLTK_LOCAL_DIR)
+
 # 需要的资源：分词 + 词形还原(wordnet) + 词性标注
-for pkg in ['punkt','wordnet','omw-1.4']:
+def _ensure_pkg(pkg: str):
     try:
-        nltk.data.find(f'corpora/{pkg}') if 'wordnet' in pkg else nltk.data.find(f'tokenizers/{pkg}')
+        if pkg == 'punkt':
+            nltk.data.find('tokenizers/punkt')
+        elif 'tagger' in pkg:
+            nltk.data.find(f'taggers/{pkg}')
+        else:
+            nltk.data.find(f'corpora/{pkg}')
     except LookupError:
-        nltk.download(pkg)
+        try:
+            os.makedirs(_NLTK_LOCAL_DIR, exist_ok=True)
+            nltk.download(pkg, download_dir=_NLTK_LOCAL_DIR)
+        except Exception:
+            # 若离线则静默，后续会走回退逻辑
+            pass
+
+for _pkg in ['punkt','wordnet','omw-1.4']:
+    _ensure_pkg(_pkg)
 # 优先使用新的英文感知版感知器标注器；若不存在则回退旧版
 _POS_RESOURCE_OK = True # 词性标注资源
 try:
@@ -15,11 +36,12 @@ try:
     except LookupError:
         nltk.data.find('taggers/averaged_perceptron_tagger')
 except LookupError:
+    # 定向下载至本地目录
     try:
-        nltk.download('averaged_perceptron_tagger_eng')
+        _ensure_pkg('averaged_perceptron_tagger_eng')
     except Exception:
         try:
-            nltk.download('averaged_perceptron_tagger')
+            _ensure_pkg('averaged_perceptron_tagger')
         except Exception:
             _POS_RESOURCE_OK = False
 from nltk.stem import WordNetLemmatizer

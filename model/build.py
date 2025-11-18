@@ -161,7 +161,7 @@ class IRRA(nn.Module):
         ret.update({'temperature': 1 / logit_scale})
         # ---- 多任务损失计算 ----
         if 'itc' in self.current_task:
-            ret.update({'itc_loss_clean':objectives.compute_itc(i_feats, t_feats, logit_scale)})
+            ret.update({'itc_loss':objectives.compute_itc(i_feats, t_feats, logit_scale)})
         # ITC三视图对齐
         # 训练期：在指定起始轮之后，加入图像与 T_noisy、T_mask 的 ITC 对齐
         align_start_ep = getattr(self.args, 'align_start_epoch', 9)
