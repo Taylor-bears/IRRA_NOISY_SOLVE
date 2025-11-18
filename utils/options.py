@@ -142,6 +142,26 @@ def get_args():
         help="epoch index (1-based) after which test-time noise masking is enabled; 0=immediate if --mask_noise_at_test is set",
     )
 
+    # 训练期：三视图（I↔T_clean/主、I↔T_noisy、I↔T_mask）对齐的起始epoch与权重
+    parser.add_argument(
+        "--align_start_epoch",
+        type=int,
+        default=9,
+        help="epoch index (1-based) to start adding ITC alignments with T_noisy and T_mask during training，表示从第几轮开始启用三视图对齐",
+    )
+    parser.add_argument(
+        "--itc_noisy_weight",
+        type=float,
+        default=1.0,
+        help="loss weight for ITC alignment on T_noisy，ITC_noisy文本的对比损失权重",
+    )
+    parser.add_argument(
+        "--itc_mask_weight",
+        type=float,
+        default=1.0,
+        help="loss weight for ITC alignment on T_mask (label-based masking)，ITC_mask文本的对比损失权重",
+    )
+
     # 评估器实现选择：baseline(与原IRRA一致) 或 extended(支持测试期噪声掩码)
     parser.add_argument(
         "--eval_impl",

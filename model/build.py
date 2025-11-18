@@ -1,5 +1,6 @@
 from model import objectives
 from .clip_model import Transformer, QuickGELU, LayerNorm, build_CLIP_from_openai_pretrained, convert_weights
+from utils.simple_tokenizer import SimpleTokenizer as _Tokenizer
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,6 +20,15 @@ class IRRA(nn.Module):
         self.embed_dim = base_cfg['embed_dim'] # 特征维度
         # 温度参数
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
+
+        # 训练期构造 mask 文本所需的 <|mask|> token id（与数据集一致）
+        try:
+            self._tokenizer = _Tokenizer()
+            self.mask_token_id = int(self._tokenizer.encoder.get("<|mask|>", 0))
+        except Exception:
+            # 回退：若构造失败，使用0（通常为PAD）；不会在未开启对齐阶段使用
+            self._tokenizer = None
+            self.mask_token_id = 0
 
         # 分类头
         #  ID分类任务，行人重识别
@@ -116,6 +126,8 @@ class IRRA(nn.Module):
         # return x.float() # for CLIP ResNet visual model
 
     # 文本编码（取EOS令牌）
+    # ===== 这里一定要记清楚！！！base_model.encode_text编码的是序列特征，encode_text编码的是全局特征 =====
+    # ===== 另一个要记清楚的点！！encode得到的是token的特征序列，而token是通过tokenizer序列化得到的，这两个过程要区分开 =====
     def encode_text(self, text):
         x = self.base_model.encode_text(text)
         return x[torch.arange(x.shape[0]), text.argmax(dim=-1)].float()
@@ -149,7 +161,44 @@ class IRRA(nn.Module):
         ret.update({'temperature': 1 / logit_scale})
         # ---- 多任务损失计算 ----
         if 'itc' in self.current_task:
-            ret.update({'itc_loss':objectives.compute_itc(i_feats, t_feats, logit_scale)})
+            ret.update({'itc_loss_clean':objectives.compute_itc(i_feats, t_feats, logit_scale)})
+        # ITC三视图对齐
+        # 训练期：在指定起始轮之后，加入图像与 T_noisy、T_mask 的 ITC 对齐
+        align_start_ep = getattr(self.args, 'align_start_epoch', 9)
+        cur_ep = getattr(self.args, 'current_epoch', 1) 
+        enable_align = ('itc' in self.current_task) and (cur_ep >= align_start_ep)
+        if enable_align:
+            # 计算 noisy 句向量（不受 use_clean_for_retrieval 影响）
+            # 若上面已得到 text_feats（对应 noisy），直接复用；否则重新编码
+            if ('use_clean_for_retrieval' in self.args.__dict__ and getattr(self.args, 'use_clean_for_retrieval', False)):
+                noisy_seq = self.base_model.encode_text(caption_ids) # 编码序列特征
+            else:
+                # 当主任务使用 noisy 时，text_feats_for_main 即为 noisy 的序列特征
+                noisy_seq = text_feats_for_main
+            z_noisy = noisy_seq[torch.arange(noisy_seq.shape[0]), caption_ids.argmax(dim=-1)].float() # 提取全局特征
+
+            # 基于 noisy_label 构造 mask 文本：直接在差异处替换为 <|mask|>
+            itc_noisy_w = getattr(self.args, 'itc_noisy_weight', 0.4)
+            itc_mask_w = getattr(self.args, 'itc_mask_weight', 0.7)
+            # noisy 对齐
+            if itc_noisy_w > 0:
+                ret.update({'itc_loss_noisy': objectives.compute_itc(i_feats, z_noisy, logit_scale) * itc_noisy_w})
+
+            # mask 对齐（需要 noise_labels）
+            if ('noise_labels' in batch) and (itc_mask_w > 0):
+                noise_labels = batch['noise_labels']
+                # 构造 mask_ids：在 label==1 的位置替换为 <|mask|>
+                mask_ids = caption_ids.clone()
+                try:
+                    # 仅在noise_labels为1的位置替换为 <|mask|>
+                    mask_ids = torch.where(noise_labels.bool(), torch.full_like(mask_ids, self.mask_token_id), mask_ids)
+                except Exception:
+                    # 形状不匹配等异常时，跳过mask分支
+                    mask_ids = None
+                if mask_ids is not None:
+                    mask_seq = self.base_model.encode_text(mask_ids) # 编码得到序列特征
+                    z_mask = mask_seq[torch.arange(mask_seq.shape[0]), mask_ids.argmax(dim=-1)].float() # 提取全局特征
+                    ret.update({'itc_loss_mask': objectives.compute_itc(i_feats, z_mask, logit_scale) * itc_mask_w})
         
         if 'sdm' in self.current_task:
             ret.update({'sdm_loss':objectives.compute_sdm(i_feats, t_feats, batch['pids'], logit_scale)})
@@ -195,7 +244,11 @@ class IRRA(nn.Module):
             ret.update({'mlm_acc': acc})
 
         # 噪声检测分支（token-level 二分类）：输入为噪声文本与对应图像
-        if getattr(self.args, 'noise_detection', False) and ('noise_labels' in batch): # new
+        # 起始轮门控：在 noise_start_epoch 之前不计算该分支，节省开销并与三视图门控一致
+        noise_enabled = getattr(self.args, 'noise_detection', False)
+        cur_ep = getattr(self.args, 'current_epoch', 1)
+        noise_start_ep = getattr(self.args, 'noise_start_epoch', 0)
+        if noise_enabled and ('noise_labels' in batch) and (noise_start_ep == 0 or cur_ep >= noise_start_ep): # new
             # 使用原始caption_ids（噪声文本）对应的文本序列特征作为query
             # 若主任务用了 clean 文本，则此处需要重新编码 noisy 文本序列
             if clean_ids is not None:

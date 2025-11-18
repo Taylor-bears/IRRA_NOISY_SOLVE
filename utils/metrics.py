@@ -413,9 +413,18 @@ class Evaluator:
                         mask_list = build_attribute_mask(words, spans, text_length=L, offset=1)
                         return torch.tensor(mask_list, dtype=torch.bool, device=row_tokens.device)
 
-                # 步骤四：计算最终相似矩阵 S_final
+                # 若存在clean文本通道，基于原始字符串构造difflib的token级GT（与训练一致）
+                has_clean = ('clean' in self.txt_loaders)
+                clean_dataset = self.txt_loaders['clean'].dataset if has_clean else None
+                noisy_dataset = txt_loader.dataset
+
+                # 步骤四：计算最终相似矩阵 S_final，同时统计每个K路径的噪声预测精度（可选）
                 all_rows = []  # 收集每个batch的 S_final_batch
                 all_qids = []
+                # 统计每个K路径的噪声预测准确率：累计正确数与总数
+                noise_correct_per_k = None
+                noise_total_per_k = None
+                global_idx = 0 # 表示当前处理到第几个文本样本了，主要用于噪声预测准确率记录处理文本的个数
                 with torch.no_grad():
                     # txt_loader来自于Dataloder，逐batch处理，所以这里的pid, caption是一个batch内的数据
                     for pid, caption in txt_loader:
@@ -434,6 +443,69 @@ class Evaluator:
                         # 提取噪声文本序列特征用于后续跨模态融合，预测噪声损失
                         seq_text_feats = model.base_model.encode_text(caption)  # (B, L_t, D)
 
+                        # 使用difflib在词级对齐并映射到token级GT；可选属性过滤
+                        gt_noise_batch = None  # (B,L) long(0/1)
+                        eval_mask_batch = None  # (B,L) bool
+                        if has_clean:
+                            noisy_caps_strs = noisy_dataset.captions[global_idx:global_idx+B]
+                            clean_caps_strs = clean_dataset.captions[global_idx:global_idx+B]
+                            gt_list = [] # 相当于noisy_label
+                            msk_list = [] # 相当于noisy文本的attribute_mask
+                            import regex as re
+                            import difflib
+                            for b in range(B):
+                                noisy_cap = noisy_caps_strs[b]
+                                clean_cap = clean_caps_strs[b]
+                                word_pattern = r"[A-Za-z0-9]+|[^\sA-Za-z0-9]+"
+                                clean_words = re.findall(word_pattern, clean_cap)
+                                noisy_words = re.findall(word_pattern, noisy_cap)
+                                matcher = difflib.SequenceMatcher(a=clean_words, b=noisy_words)
+                                noise_word_flags = [0] * len(noisy_words)
+                                for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                                    if tag == 'replace' or tag == 'insert':
+                                        for j in range(j1, j2):
+                                            if 0 <= j < len(noisy_words):
+                                                noise_word_flags[j] = 1
+                                # 将 noisy_words 映射到 token span
+                                noisy_token_ids = []
+                                word_to_token_span = []
+                                cur = 0
+                                for w in noisy_words:
+                                    t_ids = tokenizer.encode(w)
+                                    noisy_token_ids.extend(t_ids)
+                                    word_to_token_span.append((cur, cur + len(t_ids)))
+                                    cur += len(t_ids)
+                                # 有效范围mask：从1到第一个eot-1
+                                eval_mask = torch.zeros(L, dtype=torch.bool, device=device)
+                                end_pos = L - 1
+                                if eot_token_id is not None:
+                                    eot_positions = (caption[b] == eot_token_id).nonzero(as_tuple=False)
+                                    if eot_positions.numel() > 0:
+                                        end_pos = int(eot_positions[0].item())
+                                start = 1
+                                if end_pos > start:
+                                    eval_mask[start:end_pos] = True
+                                # token级GT
+                                gt_noise = torch.zeros(L, dtype=torch.long, device=device)
+                                for wi, flag in enumerate(noise_word_flags):
+                                    if flag == 1 and wi < len(word_to_token_span):
+                                        t_start = 1 + word_to_token_span[wi][0]
+                                        t_end = 1 + word_to_token_span[wi][1]
+                                        t_start = min(t_start, L)
+                                        t_end = min(t_end, L)
+                                        if t_start < t_end:
+                                            gt_noise[t_start:t_end] = 1
+                                # 属性过滤：仅在属性token上统计
+                                if enable_attr_filter:
+                                    from utils.attribute_extractor import build_attribute_mask
+                                    attr_mask_list = build_attribute_mask(noisy_words, word_to_token_span, text_length=L, offset=1)
+                                    attr_mask = torch.tensor(attr_mask_list, dtype=torch.bool, device=device)
+                                    eval_mask = eval_mask & attr_mask
+                                gt_list.append(gt_noise)
+                                msk_list.append(eval_mask)
+                            gt_noise_batch = torch.stack(gt_list, dim=0) if gt_list else None
+                            eval_mask_batch = torch.stack(msk_list, dim=0) if msk_list else None
+
                         # C) 针对每个路径 i 产生 masked caption，并计算对应相似矩阵 S_i
                         S_acc_batch = S0_batch.clone()
                         for kk in range(k):
@@ -443,13 +515,24 @@ class Evaluator:
                             logits_k = model.noise_detection_head(fused_k)
                             prob_k = torch.softmax(logits_k, dim=-1)[..., 1]  # (B, L_t)
 
+                            # 若有GT，统计该路径噪声预测精度
+                            if (gt_noise_batch is not None) and (eval_mask_batch is not None):
+                                if noise_correct_per_k is None:
+                                    noise_correct_per_k = [0 for _ in range(k)] # [kk]记录第kk个路径上所有batch样本的正确预测数量总和
+                                    noise_total_per_k = [0 for _ in range(k)] # [kk]记录第kk个路径上所有batch样本的评估token总数
+                                pred_k = (prob_k > prob_thresh) # (B,L) bool
+                                correct = ((pred_k == gt_noise_batch.bool()) & eval_mask_batch).sum().item() # item将结果转为标量，所以说每个样本的指标都是累加到一起的，一整个batch的
+                                total = eval_mask_batch.sum().item()
+                                noise_correct_per_k[kk] += correct
+                                noise_total_per_k[kk] += total
+
                             # 生成该路径的 masked captions
                             masked_caption = caption.clone()
                             for b in range(B): # 针对batch内每个样本，相当于每个样本的txt与其第kk相似的图像融合掩码得到batch个mask_caption
                                 end_pos = L - 1
                                 if eot_token_id is not None:
                                     eot_positions = (masked_caption[b] == eot_token_id).nonzero(as_tuple=False)
-                                    if eot_positions.numel() > 0:
+                                    if eot_positions.numel() > 0: 
                                         end_pos = int(eot_positions[0].item())
                                 valid_range = (1, max(1, end_pos))
                                 if valid_range[1] <= valid_range[0]:
@@ -484,6 +567,7 @@ class Evaluator:
                         S_final_batch = S_acc_batch / float(k + 1)
                         all_rows.append(S_final_batch) # 收集每个batch的最终相似矩阵
                         all_qids.append(pid.view(-1)) # 收集query ids
+                        global_idx += B
 
                 similarity = torch.cat(all_rows, dim=0)
                 qids = torch.cat(all_qids, dim=0)
@@ -493,6 +577,18 @@ class Evaluator:
                 t2i_cmc, t2i_mAP, t2i_mINP, _ = rank(similarity=similarity, q_pids=qids, g_pids=gids, max_rank=10, get_mAP=True)
                 t2i_cmc, t2i_mAP, t2i_mINP = t2i_cmc.numpy(), t2i_mAP.numpy(), t2i_mINP.numpy()
                 table.add_row([label, t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP])
+                # 打印每个K路径的token级噪声预测精度列表
+                if noise_correct_per_k is not None and noise_total_per_k is not None and sum(noise_total_per_k) > 0:
+                    acc_list = []
+                    for kk in range(len(noise_correct_per_k)):
+                        if noise_total_per_k[kk] > 0:
+                            acc_k = noise_correct_per_k[kk] / max(1, noise_total_per_k[kk])
+                        else:
+                            acc_k = 0.0
+                        acc_list.append(acc_k)
+                    acc_mean = float(np.mean(acc_list)) if len(acc_list) > 0 else 0.0 # 平均值
+                    acc_std = float(np.std(acc_list)) if len(acc_list) > 0 else 0.0 # 标准差
+                    self.logger.info(f"[NoiseEval] token-acc per-K: {[round(a,4) for a in acc_list]} (mean={acc_mean:.4f}, std={acc_std:.4f}, K={len(acc_list)})")
             else:
                 # 保持原有单路（noisy/clean）逻辑
                 # 步骤1：计算所有特征嵌入（图像库仅在首轮提取一次以节省时间）
@@ -532,11 +628,17 @@ class Evaluator:
                 ["i2t", i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP]
             )
         # table.float_format = '.4'
-        table.custom_format["R1"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["R5"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["R10"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["mAP"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["mINP"] = lambda f, v: f"{v:.3f}"
+        def _fmt_float_or_str(val):
+            try:
+                return f"{float(val):.3f}"
+            except (TypeError, ValueError):
+                return str(val)
+
+        table.custom_format["R1"] = lambda f, v: _fmt_float_or_str(v)
+        table.custom_format["R5"] = lambda f, v: _fmt_float_or_str(v)
+        table.custom_format["R10"] = lambda f, v: _fmt_float_or_str(v)
+        table.custom_format["mAP"] = lambda f, v: _fmt_float_or_str(v)
+        table.custom_format["mINP"] = lambda f, v: _fmt_float_or_str(v)
         self.logger.info("\n" + str(table))
         # 返回第一行(noisy)的R1作为主监控指标
         try:

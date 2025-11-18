@@ -64,10 +64,10 @@ def compute_itc(image_features, text_features, logit_scale):
     image-text contrastive (ITC) loss, InfoNCE
     """
     batch_size = image_features.shape[0]
+    # 这个label代表<文本0对于图像0，文本1对应图像1...>的对应关系，所以利用arange生成
     labels = torch.arange(start=0, end=batch_size, dtype=torch.int64)
     labels = labels.to(image_features.device)
 
-    
     # normalized features
     image_norm = image_features / image_features.norm(dim=-1, keepdim=True)
     text_norm = text_features / text_features.norm(dim=-1, keepdim=True)
@@ -76,9 +76,9 @@ def compute_itc(image_features, text_features, logit_scale):
     logits_per_image = logit_scale * image_norm @ text_norm.t()
     logits_per_text = logits_per_image.t()
 
-    loss_i = F.cross_entropy(logits_per_image, labels)
-    loss_t =F.cross_entropy(logits_per_text, labels)
-    loss = (loss_i +  loss_t)/2
+    loss_i = F.cross_entropy(logits_per_image, labels) # 图像到文本的对比损失
+    loss_t =F.cross_entropy(logits_per_text, labels) # 文本到图像的对比损失
+    loss = (loss_i +  loss_t)/2 # 平均作为最终损失
 
     return loss
 

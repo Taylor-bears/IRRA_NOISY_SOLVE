@@ -46,20 +46,25 @@ class CUHKPEDES(BaseDataset):
 
         self.train_annos, self.test_annos, self.val_annos = self._split_anno(self.anno_path)
         # 若提供了带噪声标注的测试集JSON，则读取对照测试集（顺序与数量与 reid_raw 保持一致）
+        self.test_compare_annos = None
+        has_compare = False
         if test_noisy_json:
             try:
-                #  self.test_annos 沿用reid_raw里的分割得到，因为那个里面的test是含有20%/50%/80%比例噪声的文本，而不是全部都是噪声的文本
-                noisy_annos = read_json(test_noisy_json) # compare_annos 包含每对干净与噪声文本
+                noisy_annos = read_json(test_noisy_json)  # compare_annos 包含每对干净与噪声文本
                 self.test_compare_annos = [a for a in noisy_annos if a.get('split', 'test') == 'test']
                 self.logger.info(f"Loaded compare test json: {test_noisy_json} with {len(self.test_compare_annos)} entries")
+                has_compare = True
             except Exception as e:
                 self.logger.warning(f"Failed to read test noisy json '{test_noisy_json}': {e}. Fallback to default test from reid_raw.json")
+                self.test_compare_annos = None
+                has_compare = False
 
         self.train, self.train_id_container = self._process_anno(self.train_annos, training=True)
-        if test_noisy_json:
+        if has_compare:
             self.test, self.test_id_container = self._process_anno(self.test_annos, test_compare_annos=self.test_compare_annos)
         else:
             self.test, self.test_id_container = self._process_anno(self.test_annos)
+        # 验证集从不使用 compare json
         self.val, self.val_id_container = self._process_anno(self.val_annos)
 
         if verbose:
@@ -82,7 +87,9 @@ class CUHKPEDES(BaseDataset):
 
     def _process_anno(self, annos: List[dict], training=False, test_compare_annos: List[dict] | None = None):
         pid_container = set()
-        assert len(test_compare_annos) == len(self.test_annos)
+        if test_compare_annos is not None:
+            # compare 与传入 annos 数量一致（仅在 test 模式下成立）
+            assert len(test_compare_annos) == len(annos), "compare test annos length mismatch"
         if training:
             dataset = []
             image_id = 0
@@ -107,8 +114,6 @@ class CUHKPEDES(BaseDataset):
             clean_captions = []
             caption_pids = []
             for index, anno in enumerate(annos):
-                assert test_compare_annos[index]['file_path'] == self.test_annos[index]['file_path']
-                assert len(self.test_annos[index]['captions']) == len(test_compare_annos[index]['captions'])
                 pid = int(anno['id'])
                 pid_container.add(pid)
                 img_path = op.join(self.img_dir, anno['file_path'])
@@ -117,7 +122,11 @@ class CUHKPEDES(BaseDataset):
                 # 兼容两种格式：仅 captions（原始），或 captions + captions_rw（带噪）
                 cap_list_noisy = anno.get('captions', None)
                 if test_compare_annos is not None:
-                    cap_list_clean = test_compare_annos[index].get('captions', []) or []
+                    cmp = test_compare_annos[index]
+                    # 路径与条数一致性断言（共享 caption_pids 的必要条件）
+                    assert cmp.get('file_path') == anno.get('file_path'), "file_path mismatch between reid_raw and compare json"
+                    cap_list_clean = cmp.get('captions', []) or []
+                    assert (cap_list_noisy is None) or (len(cap_list_noisy) == len(cap_list_clean)), "per-image captions length mismatch; cannot share caption_pids"
                 else:
                     cap_list_clean = []
                 if cap_list_noisy is None:
@@ -131,11 +140,11 @@ class CUHKPEDES(BaseDataset):
                 "image_pids": image_pids,
                 "img_paths": img_paths,
                 "caption_pids": caption_pids,
-                # noisy 版本作为默认 captions
                 "captions": noisy_captions,
-                # clean 版本
-                "clean_captions": clean_captions if clean_captions else noisy_captions,
             }
+            # 仅在 compare 存在时暴露 clean 通道；否则不添加，避免多余 loader
+            if test_compare_annos is not None:
+                dataset["clean_captions"] = clean_captions
             return dataset, pid_container
 
 

@@ -43,6 +43,11 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     # 训练循环
     for epoch in range(start_epoch, num_epoch + 1):
+        # 记录当前epoch到args，供模型内按epoch门控三视图对齐
+        try:
+            setattr(args, 'current_epoch', epoch)
+        except Exception:
+            pass
         start_time = time.time()
         for meter in meters.values():
             meter.reset()
@@ -109,6 +114,16 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             meters['mlm_loss'].update(ret.get('mlm_loss', 0), batch_size)
             meters['noise_loss'].update(ret.get('noise_loss', 0), batch_size)
             meters['consistency_loss'].update(ret.get('consistency_loss', 0), batch_size)
+            # 可选记录：三视图对齐新增损失（若存在）
+            if 'itc_loss_noisy' in ret:
+                # 若不存在预定义meter，则动态加入一次（保持轻量）
+                if 'itc_loss_noisy' not in meters:
+                    meters['itc_loss_noisy'] = AverageMeter()
+                meters['itc_loss_noisy'].update(ret['itc_loss_noisy'], batch_size)
+            if 'itc_loss_mask' in ret:
+                if 'itc_loss_mask' not in meters:
+                    meters['itc_loss_mask'] = AverageMeter()
+                meters['itc_loss_mask'].update(ret['itc_loss_mask'], batch_size)
 
             meters['img_acc'].update(ret.get('img_acc', 0), batch_size)
             meters['txt_acc'].update(ret.get('txt_acc', 0), batch_size)
