@@ -413,10 +413,65 @@ class Evaluator:
                         mask_list = build_attribute_mask(words, spans, text_length=L, offset=1)
                         return torch.tensor(mask_list, dtype=torch.bool, device=row_tokens.device)
 
-                # 若存在clean文本通道，基于原始字符串构造difflib的token级GT（与训练一致）
+                # 若存在clean文本通道，可进行全局一次性GT预计算
                 has_clean = ('clean' in self.txt_loaders)
                 clean_dataset = self.txt_loaders['clean'].dataset if has_clean else None
                 noisy_dataset = txt_loader.dataset
+                gt_noise_all = None
+                eval_mask_all = None
+                if has_clean:
+                    # 仅在需要噪声精度统计时才预计算（否则跳过以节省时间）
+                    # 在这里，我们直接算出整个数据集的GT噪声标签以及attribute_mask，而不是每个batch都去算
+                    eval_noise_acc_disable = getattr(getattr(model, 'args', object()), 'eval_noise_acc_disable', False)
+                    if not eval_noise_acc_disable:
+                        import regex as re, difflib
+                        tokenizer_full = SimpleTokenizer()
+                        text_len = caption.size(1) if 'caption' in locals() else getattr(getattr(model,'args',object()),'text_length',77)
+                        gt_list_full = []
+                        mask_list_full = []
+                        for noisy_cap, clean_cap in zip(noisy_dataset.captions, clean_dataset.captions):
+                            word_pattern = r"[A-Za-z0-9]+|[^\sA-Za-z0-9]+"
+                            clean_words = re.findall(word_pattern, clean_cap)
+                            noisy_words = re.findall(word_pattern, noisy_cap)
+                            matcher = difflib.SequenceMatcher(a=clean_words, b=noisy_words)
+                            noise_word_flags = [0] * len(noisy_words)
+                            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                                if tag in ('replace','insert'):
+                                    for j in range(j1, j2):
+                                        if 0 <= j < len(noisy_words):
+                                            noise_word_flags[j] = 1
+                            # token spans
+                            noisy_token_ids = []
+                            word_to_token_span = []
+                            cur = 0
+                            for w in noisy_words:
+                                t_ids = tokenizer_full.encode(w)
+                                noisy_token_ids.extend(t_ids)
+                                word_to_token_span.append((cur, cur + len(t_ids)))
+                                cur += len(t_ids)
+                            gt_noise = torch.zeros(text_len, dtype=torch.long)
+                            eval_mask = torch.zeros(text_len, dtype=torch.bool)
+                            end_pos = min(text_len - 1, 1 + len(noisy_token_ids))
+                            if end_pos > 1:
+                                eval_mask[1:end_pos] = True
+                            for wi, flag in enumerate(noise_word_flags):
+                                if flag == 1 and wi < len(word_to_token_span):
+                                    t_start = 1 + word_to_token_span[wi][0]
+                                    t_end = 1 + word_to_token_span[wi][1]
+                                    t_start = min(t_start, text_len)
+                                    t_end = min(t_end, text_len)
+                                    if t_start < t_end:
+                                        gt_noise[t_start:t_end] = 1
+                            if enable_attr_filter:
+                                from utils.attribute_extractor import build_attribute_mask
+                                attr_mask_list = build_attribute_mask(noisy_words, word_to_token_span, text_length=text_len, offset=1)
+                                attr_mask_tensor = torch.tensor(attr_mask_list, dtype=torch.bool)
+                                eval_mask = eval_mask & attr_mask_tensor
+                            gt_list_full.append(gt_noise)
+                            mask_list_full.append(eval_mask)
+                        if gt_list_full:
+                            gt_noise_all = torch.stack(gt_list_full, dim=0)
+                            eval_mask_all = torch.stack(mask_list_full, dim=0)
 
                 # 步骤四：计算最终相似矩阵 S_final，同时统计每个K路径的噪声预测精度（可选）
                 all_rows = []  # 收集每个batch的 S_final_batch
@@ -443,85 +498,33 @@ class Evaluator:
                         # 提取噪声文本序列特征用于后续跨模态融合，预测噪声损失
                         seq_text_feats = model.base_model.encode_text(caption)  # (B, L_t, D)
 
-                        # 使用difflib在词级对齐并映射到token级GT；可选属性过滤
-                        gt_noise_batch = None  # (B,L) long(0/1)
-                        eval_mask_batch = None  # (B,L) bool
-                        if has_clean:
-                            noisy_caps_strs = noisy_dataset.captions[global_idx:global_idx+B]
-                            clean_caps_strs = clean_dataset.captions[global_idx:global_idx+B]
-                            gt_list = [] # 相当于noisy_label
-                            msk_list = [] # 相当于noisy文本的attribute_mask
-                            import regex as re
-                            import difflib
-                            for b in range(B):
-                                noisy_cap = noisy_caps_strs[b]
-                                clean_cap = clean_caps_strs[b]
-                                word_pattern = r"[A-Za-z0-9]+|[^\sA-Za-z0-9]+"
-                                clean_words = re.findall(word_pattern, clean_cap)
-                                noisy_words = re.findall(word_pattern, noisy_cap)
-                                matcher = difflib.SequenceMatcher(a=clean_words, b=noisy_words)
-                                noise_word_flags = [0] * len(noisy_words)
-                                for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                                    if tag == 'replace' or tag == 'insert':
-                                        for j in range(j1, j2):
-                                            if 0 <= j < len(noisy_words):
-                                                noise_word_flags[j] = 1
-                                # 将 noisy_words 映射到 token span
-                                noisy_token_ids = []
-                                word_to_token_span = []
-                                cur = 0
-                                for w in noisy_words:
-                                    t_ids = tokenizer.encode(w)
-                                    noisy_token_ids.extend(t_ids)
-                                    word_to_token_span.append((cur, cur + len(t_ids)))
-                                    cur += len(t_ids)
-                                # 有效范围mask：从1到第一个eot-1
-                                eval_mask = torch.zeros(L, dtype=torch.bool, device=device)
-                                end_pos = L - 1
-                                if eot_token_id is not None:
-                                    eot_positions = (caption[b] == eot_token_id).nonzero(as_tuple=False)
-                                    if eot_positions.numel() > 0:
-                                        end_pos = int(eot_positions[0].item())
-                                start = 1
-                                if end_pos > start:
-                                    eval_mask[start:end_pos] = True
-                                # token级GT
-                                gt_noise = torch.zeros(L, dtype=torch.long, device=device)
-                                for wi, flag in enumerate(noise_word_flags):
-                                    if flag == 1 and wi < len(word_to_token_span):
-                                        t_start = 1 + word_to_token_span[wi][0]
-                                        t_end = 1 + word_to_token_span[wi][1]
-                                        t_start = min(t_start, L)
-                                        t_end = min(t_end, L)
-                                        if t_start < t_end:
-                                            gt_noise[t_start:t_end] = 1
-                                # 属性过滤：仅在属性token上统计
-                                if enable_attr_filter:
-                                    from utils.attribute_extractor import build_attribute_mask
-                                    attr_mask_list = build_attribute_mask(noisy_words, word_to_token_span, text_length=L, offset=1)
-                                    attr_mask = torch.tensor(attr_mask_list, dtype=torch.bool, device=device)
-                                    eval_mask = eval_mask & attr_mask
-                                gt_list.append(gt_noise)
-                                msk_list.append(eval_mask)
-                            gt_noise_batch = torch.stack(gt_list, dim=0) if gt_list else None
-                            eval_mask_batch = torch.stack(msk_list, dim=0) if msk_list else None
+                        # 直接切片获取预计算 GT（若存在）
+                        gt_noise_batch = gt_noise_all[global_idx:global_idx+B].to(device) if gt_noise_all is not None else None
+                        eval_mask_batch = eval_mask_all[global_idx:global_idx+B].to(device) if eval_mask_all is not None else None
 
                         # C) 针对每个路径 i 产生 masked caption，并计算对应相似矩阵 S_i
                         S_acc_batch = S0_batch.clone()
+                        # 向量化所有K的融合与噪声概率计算
+                        gathered = image_seq_feats_cat[topk_idx]  # (B,k,L_img,D)
+                        Bq, kN, L_img, Dv = gathered.shape
+                        seq_rep = seq_text_feats.unsqueeze(1).expand(Bq, kN, seq_text_feats.size(1), seq_text_feats.size(2)) # (B,k,L_t,D) 将文本序列特征扩展以匹配图像特征的维度
+                        fused_all = model.cross_former(
+                            seq_rep.reshape(Bq * kN, seq_text_feats.size(1), seq_text_feats.size(2)),
+                            gathered.reshape(Bq * kN, L_img, Dv),
+                            gathered.reshape(Bq * kN, L_img, Dv)
+                        )  # (B*k, L_t, D)
+                        logits_all = model.noise_detection_head(fused_all)  # (B*k, L_t, 2)
+                        prob_all = torch.softmax(logits_all, dim=-1)[..., 1].reshape(Bq, kN, -1)  # (B,k,L_t)
                         for kk in range(k):
-                            # 选出第kk个Top-K图像序列特征
-                            sel_seq = image_seq_feats_cat[topk_idx[:, kk]]  # (B, L_img, D)
-                            fused_k = model.cross_former(seq_text_feats, sel_seq, sel_seq)  # (B, L_t, D)
-                            logits_k = model.noise_detection_head(fused_k)
-                            prob_k = torch.softmax(logits_k, dim=-1)[..., 1]  # (B, L_t)
+                            prob_k = prob_all[:, kk, :]
 
                             # 若有GT，统计该路径噪声预测精度
                             if (gt_noise_batch is not None) and (eval_mask_batch is not None):
                                 if noise_correct_per_k is None:
-                                    noise_correct_per_k = [0 for _ in range(k)] # [kk]记录第kk个路径上所有batch样本的正确预测数量总和
-                                    noise_total_per_k = [0 for _ in range(k)] # [kk]记录第kk个路径上所有batch样本的评估token总数
+                                    noise_correct_per_k = [0 for _ in range(k)] # [kk]记录第kk个路径上所有batch样本的正确预测数量总和，会累计所有batch
+                                    noise_total_per_k = [0 for _ in range(k)] # [kk]记录第kk个路径上所有batch样本的评估token总数，会累计所有batch
                                 pred_k = (prob_k > prob_thresh) # (B,L) bool
-                                correct = ((pred_k == gt_noise_batch.bool()) & eval_mask_batch).sum().item() # item将结果转为标量，所以说每个样本的指标都是累加到一起的，一整个batch的
+                                correct = ((pred_k == gt_noise_batch.bool()) & eval_mask_batch).sum().item()
                                 total = eval_mask_batch.sum().item()
                                 noise_correct_per_k[kk] += correct
                                 noise_total_per_k[kk] += total

@@ -6,6 +6,7 @@ data/
 *.npy
 *.csv
 *.json
+nltk/
 
 # IDE文件
 .idea/

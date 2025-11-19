@@ -76,6 +76,9 @@ if __name__ == '__main__':
     if getattr(args, 'eval_impl', 'extended') == 'baseline':
         from utils.metrics_baseline import Evaluator as EvaluatorBaseline
         evaluator = EvaluatorBaseline(val_img_loader, val_txt_loader)
+    elif getattr(args, 'eval_impl', 'extended') == 'mask_from_real':
+        from utils.metrics_mask_from_real import Evaluator as EvaluatorMaskFromReal
+        evaluator = EvaluatorMaskFromReal(val_img_loader, val_txt_loader, mask_noise)
     else:
         evaluator = EvaluatorExtended(val_img_loader, val_txt_loader, mask_noise)
 

@@ -4,10 +4,9 @@ DATASET_NAME="CUHK-PEDES"
 
 CUDA_VISIBLE_DEVICES=3 \
 /data1/baiyang/anaconda/envs/bear_irra/bin/python train.py \
---name irra_v1.7 \
+--name irra_v_mask_form_real \
 --img_aug \
 --batch_size 64 \
---MLM \
 --dataset_name $DATASET_NAME \
 --loss_names 'sdm+id+itc' \
 --val_dataset test \
@@ -20,25 +19,13 @@ CUDA_VISIBLE_DEVICES=3 \
 --noise_start_epoch 9 \
 --noise_warmup_epochs 8 \
 --align_start_epoch 9 \
---itc_noisy_weight 0.7 \
---itc_mask_weight 0.4 \
+--itc_noisy_weight 1 \
+--itc_mask_weight 1 \
 --use_clean_for_retrieval \
 --disable_consistency_loss \
---consistency_loss_weight 0.02 \
---consistency_start_epoch 8 \
---consistency_warmup_epochs 8 \
 --mask_test_start_epoch 17 \
---eval_impl extended \
---mask_noise_at_test \
---mask_strategy hard \
---noise_ctx topk_vote \
---mask_topk 32 \
---mask_prob_thresh 0.5 \
---mask_max_ratio 0.30 \
---mask_max_tokens 6 \
---enable_attribute_filter \
---eval_noise_acc_disable
-
+--eval_impl mask_from_real \
+--mask_noise_at_test
 
 # --eval_noise_acc_disable
 # 目前不启用动态类别权重调整，关闭一致性损失

@@ -1,4 +1,5 @@
 import argparse
+from ast import parse
 
 
 def get_args():
@@ -166,9 +167,14 @@ def get_args():
     parser.add_argument(
         "--eval_impl",
         type=str,
-        choices=["baseline", "extended"],
+        choices=["baseline", "extended", "mask_from_real"],
         default="extended",
-        help="which evaluator implementation to use: baseline (original IRRA) or extended (with optional noise-masking at test)",
+        help="which evaluator implementation to use: baseline | extended | mask_from_real (mask positions from real noisy-clean diffs)",
+    )
+    parser.add_argument(
+        "--eval_noise_acc_disable",
+        action='store_true',
+        help="决定是否在测试时计算噪声预测准确率，关闭后可以大大加快评估速度",
     )
 
     # 测试集（带噪版本）JSON：用于在评估时提供 captions/clean_captions 两种文本
