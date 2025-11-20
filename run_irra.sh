@@ -20,8 +20,8 @@ CUDA_VISIBLE_DEVICES=3 \
 --noise_start_epoch 9 \
 --noise_warmup_epochs 8 \
 --align_start_epoch 9 \
---itc_noisy_weight 0.7 \
---itc_mask_weight 0.4 \
+--itc_noisy_weight 0.4 \
+--itc_mask_weight 0.7 \
 --use_clean_for_retrieval \
 --disable_consistency_loss \
 --consistency_loss_weight 0.02 \

@@ -137,9 +137,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             # 打印日志
             if (n_iter + 1) % log_period == 0:
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
-                # log loss and acc info
+                # 无论数值是否为0，只要该meter被更新过(count>0)就打印，避免早期准确率为0时不展示
                 for k, v in meters.items():
-                    if v.avg > 0:
+                    if getattr(v, 'count', 0) > 0:
                         info_str += f", {k}: {v.avg:.4f}"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
